@@ -80,6 +80,33 @@
       }
     },
     {
+      "name": "agentforce-adlc",
+      "source": "./plugins/builder/agentforce-adlc",
+      "description": "Author, discover, scaffold, deploy, test, secure, and optimize Agentforce .agent files",
+      "keywords": [
+        "agentforce",
+        "agent",
+        "adlc",
+        ".agent",
+        "voice agent",
+        "employee agent"
+      ],
+      "metadata": {
+        "match": {
+          "examplePrompts": [
+            "build me a service agent",
+            "create an employee agent",
+            "author an .agent definition"
+          ],
+          "anchorTerms": [
+            "agentforce",
+            "agent",
+            "adlc"
+          ]
+        }
+      }
+    },
+    {
       "name": "salesforce-test-drive",
       "source": "./plugins/builder/salesforce-test-drive",
       "description": "Take a Salesforce capability for a test drive — pick a curated end-to-end build from a menu (e.g. a Service help agent delivered as a website chat widget) and watch it run start to finish. A guided, rehearsable walkthrough and learning engine that checks readiness, helps connect or provision an org, then choreographs the salesforce-development skills to build the real thing.",

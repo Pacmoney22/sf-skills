@@ -3,16 +3,20 @@
 #
 # The code-enforced trust flow for one uninstalled plugin-catalog entry:
 # an accepted, same-session Salesforce-marketplace proposal installs in one
-# call; an external proposal or bare self-directed call prints the
-# plugin's name and source (+ a trust warning when the source is fetched from
-# outside this repo) and a one-time nonce bound to that exact name and source;
-# only a second external/self-directed call with the SAME nonce via --confirm proceeds to the
-# hardened, no-shell `claude plugin install ...` shell-out.
+# call; any other proposal or bare self-directed call prints the plugin's name
+# and source (+ a trust warning when the source is not that exact same-session
+# marketplace entry) and a one-time nonce bound to that exact name and source;
+# only a second confirming call with the SAME nonce via --confirm proceeds to
+# the hardened, no-shell `claude plugin install ...` shell-out.
 # `--decline` is the explicit, never-inferred decline half of the
 # plugin_loaded/plugin_suggestion_declined telemetry correlation. This test
 # asserts, fully offline (`claude` itself is stubbed -- no real install runs):
-#   - the dry run names the plugin, its source, and the external trust warning,
-#     and emits a nonce -- without ever invoking `claude`
+#   - the dry run names the plugin, its source, and its install target, and
+#     emits a nonce -- without ever invoking `claude` (the trust-warning
+#     variant of this path has no real catalog entry to exercise offline
+#     right now -- every catalog plugin is local and same-marketplace -- so it
+#     is covered by test_sf_context.py with a synthetic mismatched-source
+#     entry instead)
 #   - a wrong or malformed nonce refuses; an unknown/current/already-installed
 #     plugin name refuses; an unreadable/missing settings.json (unknown "enabled"
 #     state) still allows the dry run rather than refusing, matching
@@ -147,53 +151,26 @@ else
     "trusted fast path requires same-session selection" "$CODE_UNSELECTED" "$OUT_UNSELECTED"
 fi
 
-# An accepted proposal for a curated-allowlist external identity
-# (agentforce-adlc@claude-plugins-official) is a trusted install target: the
-# user's acceptance is the sole confirmation, so it installs immediately in one
-# official-marketplace call -- no dry run, no nonce, no trust warning. A
-# NON-allowlisted external name would still require the nonce + trust warning,
-# but there is no such catalog entry to exercise offline here (agentforce-adlc
-# is the only external row and it is allowlisted); that untrusted-external path
-# is covered by test_sf_context.py with a synthetic entry.
-EXTERNAL_SID="plugin-install-external-accept-$$-$RANDOM"
-fresh_proposal "$EXTERNAL_SID"
-printf '{"session_id":"%s","prompt_id":"p1","prompt":"install agentforce-adlc"}' \
-  "$EXTERNAL_SID" | "$CTX" prompt-dispatch >/dev/null
-write_stub 0
-OUT_EXTERNAL_ACCEPT=$(CLAUDE_CODE_SESSION_ID="$EXTERNAL_SID" \
-  stubbed_ctx plugin-install "$NAME" --accept-proposed)
-CODE_EXTERNAL_ACCEPT=$?
-EXTERNAL_ACCEPT_CALL1=$(sed -n '1p' "$STUB_LOG")
-EXTERNAL_ACCEPT_CALL2=$(sed -n '2p' "$STUB_LOG")
-if [ "$CODE_EXTERNAL_ACCEPT" -eq 0 ] \
-   && echo "$OUT_EXTERNAL_ACCEPT" | grep -q "Installed $NAME on disk" \
-   && echo "$OUT_EXTERNAL_ACCEPT" | grep -q "Run /reload-plugins now" \
-   && ! echo "$OUT_EXTERNAL_ACCEPT" | grep -q "Plugin: $NAME" \
-   && ! echo "$OUT_EXTERNAL_ACCEPT" | grep -q -- "--confirm" \
-   && ! echo "$OUT_EXTERNAL_ACCEPT" | grep -qi "TRUST WARNING" \
-   && [ "$EXTERNAL_ACCEPT_CALL1" = "plugin install $NAME@claude-plugins-official --yes" ] \
-   && [ -z "$EXTERNAL_ACCEPT_CALL2" ]; then
-  PASS=$((PASS + 1)); printf '  ok   %-60s → acceptance is sole confirmation, one official-marketplace install\n' \
-    "allowlisted external proposed install installs in one call"
-else
-  FAIL=$((FAIL + 1)); printf '  FAIL %-60s → exit=%s call1=%s call2=%s out=%s\n' \
-    "allowlisted external proposed install installs in one call" "$CODE_EXTERNAL_ACCEPT" \
-    "$EXTERNAL_ACCEPT_CALL1" "$EXTERNAL_ACCEPT_CALL2" "$OUT_EXTERNAL_ACCEPT"
-fi
+# NAME (agentforce-adlc) is now a local, same-marketplace catalog entry, so its
+# --accept-proposed fast path is already covered by the "trusted proposed
+# install" case above (experience-react). Every catalog entry is local, so the
+# mismatched-source nonce + trust warning path has no real catalog entry to
+# exercise offline here; it is covered by test_sf_context.py with a synthetic
+# mismatched-source entry instead.
 
-# --- dry run: names the plugin, pin, trust warning; never invokes claude ---
+# --- dry run: names the plugin and its install target; never invokes claude -
 write_stub 0
 OUT_DRY=$(stubbed_ctx plugin-install "$NAME")
 CODE_DRY=$?
 NONCE=$(extract_nonce "$OUT_DRY")
 if [ "$CODE_DRY" -eq 0 ] \
    && echo "$OUT_DRY" | grep -q "Plugin: $NAME" \
-   && echo "$OUT_DRY" | grep -q "Installs from: $NAME@claude-plugins-official" \
-   && echo "$OUT_DRY" | grep -qi "TRUST WARNING" \
+   && echo "$OUT_DRY" | grep -q "Installs from: $NAME@salesforce" \
+   && ! echo "$OUT_DRY" | grep -qi "TRUST WARNING" \
    && echo "$OUT_DRY" | grep -q "must run /reload-plugins" \
    && [ -n "$NONCE" ] \
    && [ ! -s "$STUB_LOG" ]; then
-  PASS=$((PASS + 1)); printf '  ok   %-60s → names plugin + install target + trust warning + nonce, no claude call\n' "dry run"
+  PASS=$((PASS + 1)); printf '  ok   %-60s → names plugin + install target + nonce, no trust warning, no claude call\n' "dry run"
 else
   FAIL=$((FAIL + 1)); printf '  FAIL %-60s → exit=%s nonce=%s log=%s out=%s\n' "dry run" "$CODE_DRY" "$NONCE" "$(cat "$STUB_LOG")" "$OUT_DRY"
 fi
@@ -282,13 +259,12 @@ else
   FAIL=$((FAIL + 1)); printf '  FAIL %-60s → exit=%s out=%s\n' "missing settings.json still allows dry run (fail-open)" "$CODE_NOSETTINGS" "$OUT_NOSETTINGS"
 fi
 
-# --- confirmed install of an EXTERNAL-source plugin: claude is shelled out
-# exactly ONCE, routed to the pre-registered official marketplace
-# (`@claude-plugins-official`) with NO `salesforce` marketplace registration --
-# agentforce-adlc lives in the official marketplace, not this repo's. The
-# local-source register-then-install two-call flow (`marketplace add` this
-# repo's checkout, then `<name>@salesforce`) is covered by the "trusted
-# proposed install" (experience-react) case above. --------------------------
+# --- confirmed install via the bare nonce/--confirm path (as opposed to
+# --accept-proposed above): claude is shelled out TWICE, a best-effort
+# `marketplace add` of this repo's own checkout followed by the install call
+# itself, routed to the local "salesforce" marketplace -- same underlying
+# install routine as the "trusted proposed install" case above, exercised here
+# through the dry-run + --confirm flow instead of --accept-proposed. --------
 write_stub 0
 NONCE_OK=$(extract_nonce "$("$CTX" plugin-install "$NAME")")
 OUT_OK=$(stubbed_ctx plugin-install "$NAME" --confirm "$NONCE_OK")
@@ -303,11 +279,11 @@ if [ "$CODE_OK" -eq 0 ] \
    && echo "$OUT_OK" | grep -q "start a fresh session" \
    && echo "$OUT_OK" | grep -q "submit a concrete task to begin using it" \
    && ! echo "$OUT_OK" | grep -q "resume your original task" \
-   && [ "$CALL1" = "plugin install $NAME@claude-plugins-official --yes" ] \
-   && [ -z "$CALL2" ]; then
-  PASS=$((PASS + 1)); printf '  ok   %-60s → official-marketplace single-call argv, success message\n' "confirmed external install shells out claude once"
+   && [ "$CALL1" = "plugin marketplace add $MONOREPO_ROOT" ] \
+   && [ "$CALL2" = "plugin install $NAME@salesforce --yes" ]; then
+  PASS=$((PASS + 1)); printf '  ok   %-60s → register + install argv, success message\n' "confirmed install shells out claude via the nonce path"
 else
-  FAIL=$((FAIL + 1)); printf '  FAIL %-60s → exit=%s call1=%s call2=%s out=%s\n' "confirmed external install shells out claude once" "$CODE_OK" "$CALL1" "$CALL2" "$OUT_OK"
+  FAIL=$((FAIL + 1)); printf '  FAIL %-60s → exit=%s call1=%s call2=%s out=%s\n' "confirmed install shells out claude via the nonce path" "$CODE_OK" "$CALL1" "$CALL2" "$OUT_OK"
 fi
 
 # --- a failed claude call surfaces only exit-code metadata, never raw text -

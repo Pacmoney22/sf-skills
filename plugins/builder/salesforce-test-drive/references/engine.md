@@ -345,8 +345,9 @@ the middle of the build.
    ```bash
    "<PLUGIN_ROOT>/../salesforce-development/scripts/sf-context" plugin-install <pluginId>
    ```
-   - For a plugin whose marketplace source is **external** (a GitHub/URL source — `agentforce-adlc` is
-     one), the guarded runtime does **not** install outright: it prints the plugin's source and a
+   - For a plugin whose marketplace source is **external** (a GitHub/URL source, not an exact
+     `./plugins/builder/<name>` path in this repo), the guarded runtime does **not** install
+     outright: it prints the plugin's source and a
      **nonce-bound confirmation request**. Relay that stdout to the user verbatim, get their explicit
      confirmation, then complete the install by running exactly the `… plugin-install <pluginId>
      --confirm <nonce>` line the runtime handed you. Do not fabricate your own confirmation and do not

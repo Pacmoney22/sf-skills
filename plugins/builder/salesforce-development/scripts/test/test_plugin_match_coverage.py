@@ -437,7 +437,6 @@ class MatchTextSkillDriftTests(unittest.TestCase):
                 "demo-quantum-teleport-orchestrate": "orchestrate quantum teleportation entanglement",
             })
             drift = self.mod._drift_for_plugin(plugin, root)
-        self.assertTrue(drift.is_local)
         self.assertEqual(drift.skill_count, 2)
         # The widget skill's vocab is in the match text; the quantum one's is not.
         self.assertEqual(drift.unrepresented, ("demo-quantum-teleport-orchestrate",))
@@ -507,21 +506,10 @@ class MatchTextSkillDriftTests(unittest.TestCase):
             drift = self.mod._drift_for_plugin(plugin, root)
         self.assertEqual(drift.unrepresented, ("org",))
 
-    def test_external_plugin_is_skipped_never_a_false_warning(self):
-        ext = {
-            "name": "ext",
-            "source": {"source": "url", "url": "https://example/x.git"},
-            "match": {"description": "d", "keywords": ["k"], "examplePrompts": ["p"]},
-        }
-        drift = self.mod._drift_for_plugin(ext, Path("/nonexistent"))
-        self.assertFalse(drift.is_local)
-        self.assertEqual(drift.unrepresented, ())
-        self.assertIn("external", drift.note)
-
-    def test_local_plugin_without_skills_dir_is_local_not_external(self):
-        # A LOCAL plugin (string source) that ships no skills/ dir must be
-        # classified local-with-no-skills, NOT mislabeled as an external skip.
-        # This is the salesforce-test-drive shape in the real catalog.
+    def test_plugin_without_skills_dir_is_empty_not_drifting(self):
+        # A plugin that ships no skills/ dir must be classified empty, not
+        # flagged as drifting. This is the salesforce-test-drive shape in the
+        # real catalog.
         plugin = {
             "name": "toolkit",
             "source": "./plugins/builder/toolkit",  # exists on disk, but has no skills/
@@ -530,7 +518,6 @@ class MatchTextSkillDriftTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / "plugins/builder/toolkit").mkdir(parents=True)
             drift = self.mod._drift_for_plugin(plugin, Path(td))
-        self.assertTrue(drift.is_local)
         self.assertEqual(drift.skill_count, 0)
         self.assertEqual(drift.unrepresented, ())
         self.assertIn("no skills", drift.note)

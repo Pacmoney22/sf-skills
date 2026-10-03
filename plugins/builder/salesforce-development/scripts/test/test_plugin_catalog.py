@@ -127,32 +127,6 @@ class PluginCatalogGenerationTests(unittest.TestCase):
         local_row = next(row for row in data["plugins"] if row["name"] == "salesforce-development")
         self.assertEqual(local_row["source"], "./plugins/builder/salesforce-development")
 
-    def test_external_plugin_source_is_the_verbatim_source_object(self):
-        data = self.mod.build_catalog(REPO_ROOT, PLUGIN_ROOT)
-        external_row = next(row for row in data["plugins"] if row["name"] == "agentforce-adlc")
-        self.assertIsInstance(external_row["source"], dict)
-        self.assertEqual(external_row["source"].get("source"), "url")
-        self.assertEqual(
-            external_row["source"].get("url"),
-            "https://github.com/SalesforceAIResearch/agentforce-adlc.git",
-        )
-        self.assertEqual(external_row["source"].get("ref"), "main")
-
-    def test_agentforce_adlc_row_routes_to_its_trusted_allowlist_identity(self):
-        # End-to-end guard for the curated trust allowlist: the ONE external row we
-        # trust for looser install confirmation must, when fed through sf_context's
-        # shape-based routing, resolve to an identity that is actually in
-        # _TRUSTED_EXTERNAL_INSTALLS. A future rename or re-route of this row would
-        # otherwise silently turn the allowlist entry into a dead no-op (or, worse,
-        # un-trust the plugin we intended to trust) without any test noticing.
-        sfx = load_module(SCRIPTS / "sf_context.py", "sf_context_trust_smoke")
-        data = self.mod.build_catalog(REPO_ROOT, PLUGIN_ROOT)
-        row = next(r for r in data["plugins"] if r["name"] == "agentforce-adlc")
-        marketplace = sfx._plugin_install_marketplace_name(row["name"], row)
-        self.assertEqual(marketplace, "claude-plugins-official")
-        self.assertIn((row["name"], marketplace), sfx._TRUSTED_EXTERNAL_INSTALLS)
-        self.assertTrue(sfx._plugin_install_is_trusted_source(row["name"], row))
-
     def test_match_text_is_verbatim_from_the_marketplace(self):
         marketplace = json.loads(
             (REPO_ROOT / self.mod.MARKETPLACE_RELATIVE).read_text(encoding="utf-8")
@@ -169,9 +143,35 @@ class PluginCatalogGenerationTests(unittest.TestCase):
             )
 
     def test_runtime_load_strictly_rejects_malformed_artifacts(self):
-        baseline = self.mod.build_catalog(REPO_ROOT, PLUGIN_ROOT)
+        # Every catalog entry is local; two string-sourced plugins are enough
+        # to build the baseline this test mutates (two entries so reversing
+        # their order is a meaningful "unsorted names" mutation).
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            (repo_root / ".claude-plugin").mkdir(parents=True)
+            marketplace_path = repo_root / self.mod.MARKETPLACE_RELATIVE
+            entries = [
+                {
+                    "name": "local-example-plugin",
+                    "source": "./plugins/local-example-plugin",
+                    "description": "A local example plugin.",
+                    "keywords": ["example"],
+                    "metadata": {"match": {"examplePrompts": ["use the local example plugin"]}},
+                },
+                {
+                    "name": "other-example-plugin",
+                    "source": "./plugins/other-example-plugin",
+                    "description": "Another local example plugin.",
+                    "keywords": ["example"],
+                    "metadata": {"match": {"examplePrompts": ["use the other example plugin"]}},
+                },
+            ]
+            marketplace_path.write_text(
+                json.dumps({"name": "test-marketplace", "plugins": entries}), encoding="utf-8"
+            )
+            (repo_root / "config.yml").write_text("internalPlugins: []\n", encoding="utf-8")
+            baseline = self.mod.build_catalog(repo_root, repo_root)
         str_index = next(i for i, row in enumerate(baseline["plugins"]) if isinstance(row["source"], str))
-        dict_index = next(i for i, row in enumerate(baseline["plugins"]) if isinstance(row["source"], dict))
 
         def mutate(label, change):
             data = copy.deepcopy(baseline)
@@ -188,8 +188,8 @@ class PluginCatalogGenerationTests(unittest.TestCase):
             mutate("unsorted names", lambda d: d["plugins"].reverse()),
             mutate("extra plugin key", lambda d: d["plugins"][str_index].update(origin="local")),
             mutate("empty string source", lambda d: d["plugins"][str_index].update(source="")),
-            mutate("non-string/non-object source", lambda d: d["plugins"][str_index].update(source=123)),
-            mutate("empty object source", lambda d: d["plugins"][dict_index].update(source={})),
+            mutate("non-string source", lambda d: d["plugins"][str_index].update(source=123)),
+            mutate("object source", lambda d: d["plugins"][str_index].update(source={})),
             mutate("bad match keys", lambda d: d["plugins"][str_index]["match"].pop("keywords")),
             mutate("empty keywords", lambda d: d["plugins"][str_index]["match"].update(keywords=[])),
             mutate("duplicate keywords", lambda d: d["plugins"][str_index]["match"].update(keywords=["a", "a"])),
@@ -288,19 +288,6 @@ class BuildCatalogTests(unittest.TestCase):
             self.assertEqual(row["source"], "./plugins/sample-plugin")
             self.assertEqual(row["match"]["keywords"], ["sample"])
             self.assertEqual(row["match"]["examplePrompts"], ["test the sample plugin"])
-
-    def test_external_source_object_round_trips_verbatim(self):
-        with tempfile.TemporaryDirectory() as td:
-            repo_root = Path(td)
-            source = {"source": "github", "repo": "acme/widget", "ref": "v1.2.3"}
-            self._write_repo(repo_root, [
-                self._entry(
-                    "widget", copy.deepcopy(source),
-                    "A widget plugin.", ["widget"], ["make a widget"],
-                ),
-            ], held=[])
-            data = self.mod.build_catalog(repo_root, repo_root)
-            self.assertEqual(data["plugins"][0]["source"], source)
 
     def test_held_plugin_is_omitted(self):
         with tempfile.TemporaryDirectory() as td:
@@ -401,18 +388,6 @@ class HeldPluginDescriptionsTests(unittest.TestCase):
             ])
             result = self.mod.held_plugin_descriptions(repo_root, repo_root)
             self.assertEqual(result, {"held-plugin": "A held plugin description."})
-
-    def test_held_external_plugin_description_is_returned(self):
-        with tempfile.TemporaryDirectory() as td:
-            repo_root = Path(td)
-            self._write_config(repo_root, ["held-external"])
-            self._write_marketplace(repo_root, [
-                {"name": "held-external",
-                 "source": {"source": "github", "repo": "acme/held", "ref": "v1"},
-                 "description": "A held external plugin description."},
-            ])
-            result = self.mod.held_plugin_descriptions(repo_root, repo_root)
-            self.assertEqual(result, {"held-external": "A held external plugin description."})
 
     def test_malformed_marketplace_raises(self):
         with tempfile.TemporaryDirectory() as td:
@@ -614,7 +589,7 @@ class ScorePromptAgainstCatalogTests(unittest.TestCase):
             "Author, scaffold, and deploy Agentforce agent files for service agents.",
             ["agentforce", "agent", "service agent"],
             ["build me a service agent", "create an employee agent"],
-            source={"source": "github", "repo": "acme/agent", "ref": "v1"},
+            source="./plugins/agent-plugin",
         )
         catalog_data = {"plugins": [flow_plugin, agent_plugin]}
         matches = self.mod.score_prompt_against_catalog(

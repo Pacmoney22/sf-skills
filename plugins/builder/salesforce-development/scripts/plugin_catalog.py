@@ -7,18 +7,16 @@ hashed for provenance). Claude Code's real marketplace schema already carries
 everything the matcher needs natively — a plugin entry's ``description``,
 ``keywords`` (the discovery-tags array), a free-form ``metadata`` object (which
 Claude Code itself never reads, so it is the correct home for our
-``metadata.match.examplePrompts``), and a ``source`` that is either a
-relative-path string (a local plugin in this repo) or a source object
-(``github``/``url``/``git-subdir``/``npm``/``archive``/``command`` for a plugin
-hosted elsewhere).
+``metadata.match.examplePrompts``), and a ``source`` that is a relative-path
+string pointing at the plugin's own directory in this repo. Every catalog
+entry is local; there is no externally hosted (github/url/npm/archive/...)
+source shape.
 
-Opt-in rule (uniform for every entry, local or external): an entry is a
-suggestion candidate **iff** it declares a non-empty ``keywords`` array AND is
-not held via ``internalPlugins`` in the repo-root ``config.yml``. An opted-in
-entry must also carry ``metadata.match.examplePrompts``; keywords without
-example prompts is a data error the generator raises on (fail fast). "Local vs
-external" is no longer stored — it is trivially derivable from whether ``source``
-is a string vs. an object.
+Opt-in rule: an entry is a suggestion candidate **iff** it declares a
+non-empty ``keywords`` array AND is not held via ``internalPlugins`` in the
+repo-root ``config.yml``. An opted-in entry must also carry
+``metadata.match.examplePrompts``; keywords without example prompts is a data
+error the generator raises on (fail fast).
 
 Because Claude Code copies only a plugin's own directory into the local plugin
 cache at install time (never the sibling ``.claude-plugin/marketplace.json`` two
@@ -154,7 +152,7 @@ def build_catalog(repo_root: Path, plugin_root: Path) -> dict:
         if type(description) is not str or not description:
             raise PluginCatalogError(f"{marketplace_path}: {name!r} is missing a marketplace description")
         source = entry.get("source")
-        if not ((type(source) is str and source) or (type(source) is dict and source)):
+        if type(source) is not str or not source:
             raise PluginCatalogError(f"{marketplace_path}: {name!r} has an invalid marketplace source")
         keywords = entry["keywords"]
         if not all(type(item) is str and item for item in keywords):
@@ -297,11 +295,9 @@ def _validate_catalog(data, context: str) -> None:
         if type(name) is not str or not registry.NAME_PATTERN.fullmatch(name) or len(name) > 64:
             raise PluginCatalogError(f"{row_context}: invalid name")
         source = row["source"]
-        # A local plugin's source is a relative-path string; an externally hosted
-        # plugin's is a non-empty source object (github/url/npm/archive/...). We
-        # keep it verbatim and only check it is one of those two shapes; whether
-        # a source is trusted (local) is derived from `isinstance(source, str)`.
-        if not ((type(source) is str and source) or (type(source) is dict and source)):
+        # Every catalog entry is local: its source is a non-empty relative-path
+        # string pointing at the plugin's own directory in this repo.
+        if type(source) is not str or not source:
             raise PluginCatalogError(f"{row_context}: invalid source")
         match = row["match"]
         if type(match) is not dict or not (_MATCH_REQUIRED_KEYS <= set(match) <= _MATCH_KEYS):

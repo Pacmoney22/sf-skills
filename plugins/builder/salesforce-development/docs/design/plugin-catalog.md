@@ -114,10 +114,11 @@ Two properties are load-bearing and easy to erode by accident during future edit
   plausible but false cross-product matches.
 - **A generic word shared with the corpus cannot carry a match alone.** A plugin declares
   `metadata.match.anchorTerms` (marketplace.json) when its capability vocabulary overlaps a
-  domain-sounding-but-generic word used elsewhere in the corpus (e.g. `install` appears inside
-  `dx-org-lifecycle`'s "package post install" phrase, but is not evidence of any org-lifecycle
-  intent). `score_prompt_against_catalog`'s `require_anchor_terms` (default `True`) drops such a
-  candidate unless the prompt's matched terms include at least one of its own anchor terms —
+  domain-sounding-but-generic word used elsewhere in the corpus. For example, before package
+  post-install routing moved out of `dx-org-lifecycle`, its "package post install" phrase made
+  `install` look like org-lifecycle evidence when it was not. The scorer's `require_anchor_terms`
+  option (default `True`) drops such a candidate unless the prompt's matched terms include at least
+  one of its own anchor terms —
   closing the failure class where "install agentforce-adlc plugin" high-confidence-matched the
   wrong plugin on the word "install" alone. This gate exists to stop a generic-word coincidence
   from **interrupting** the user unprompted, so — mirroring the high/medium band split — only the
@@ -153,6 +154,12 @@ Two properties are load-bearing and easy to erode by accident during future edit
   fail-open on anything malformed, falling through to the next tier — matching this file's existing
   `except Exception: return []` posture — while the write-time `plugin-match-config set` command
   fails loud on an invalid value.
+- **Successful command-owned preference mutations emit one bounded telemetry event.** After (and
+  only after) `/salesforce-development:plugin-recommendations` successfully writes or clears the
+  saved override, it emits `plugin_recommendation_configured` with only a closed action/level pair:
+  `disable::off`, `reset::default`, `set::low`, `set::standard`, `set::high`, or `set::custom`.
+  Numeric thresholds, raw arguments, previous/effective settings, paths, prompts, and environment
+  values never enter telemetry. Native `userConfig` and environment changes remain unobserved.
 - **One session proposal ledger.** SessionStart, prompt, discovery, and bypass consumers reconcile
   against the same per-session plugin marker. The first surface owns telemetry and incidental
   paint; later prompt/tool surfaces must not deny, repaint, or count it again. Explicit discovery
@@ -184,9 +191,9 @@ hand-authored catalog. An entry becomes a discovery candidate **iff** it declare
 `keywords` array *and* is not held via `internalPlugins` in `config.yml`; entries with no keywords
 are simply invisible to the matcher. Opting in via `keywords` obliges the entry to also carry
 `metadata.match.examplePrompts` (Claude Code ignores `metadata`, so it is the correct home for
-matcher copy), and the generator fails fast if that pairing is missing. "Local vs external" is no
-longer a stored field — it is derived at read time from whether an entry's `source` is a
-relative-path string (local, in this repo) or a source object (fetched from elsewhere).
+matcher copy), and the generator fails fast if that pairing is missing. Every entry's `source` is a
+relative-path string pointing at the plugin's own directory in this repo; the catalog generator
+rejects any other shape.
 
 ## Accepted-proposal install mechanic
 
@@ -195,8 +202,7 @@ install a plugin from a trusted source. UserPromptSubmit pins that exact
 candidate and routes one fixed command: `plugin-install <name> --accept-proposed`. The runtime
 independently requires a valid same-session proposal, the same selected plugin in `selected` state,
 and a **trusted install target** (`_plugin_install_is_trusted_source` — the exact local
-`./plugins/builder/<name>` source, or an allowlisted external identity; see the trust predicate
-below). If all three checks hold, it installs in
+`./plugins/builder/<name>` source; see the trust predicate below). If all three checks hold, it installs in
 that call; no dry run, nonce, second prose confirmation, or ordinary Bash approval is added. The
 PreToolUse hook can return `allow` only for that complete standalone command and those same checks.
 Appending shell syntax, changing the name, omitting the selected workflow, or targeting an
@@ -224,7 +230,7 @@ comma-joined) rather than only descending through a fixed allowlist of generic f
 mapping's own keys are never one of those names, so a plain "descend only when the key matches"
 walk can never reach it (also a PR-1696 review finding, since fixed).
 
-An accepted external or otherwise mutable source that is **not** on the trust allowlist does
+An accepted source that is not the exact reviewed `./plugins/builder/<name>` path does
 **not** inherit that fast path. The first
 call prints the plugin name and concrete source, adds a trust warning, and returns a nonce derived
 from the exact `{name, source}` lookup. It installs nothing. Only a subsequent explicit source
@@ -241,7 +247,7 @@ path with the same validation.
 
 Every visible recommendation surface opens one private, bounded, expiring session workflow. Its
 state advances from `recommended` to `selected`, then directly to `installed` for a trusted source
-or through `awaiting-confirmation` for an external/self-directed source, and finally to `installed`
+or through `awaiting-confirmation` for an untrusted/self-directed source, and finally to `installed`
 or `declined`. A SessionStart batch can hold several candidates, but a generic reply can select one
 only when exactly one candidate remains unambiguous; an explicitly named valid proposal can always
 select itself. When a generic acceptance arrives against more than one open proposal, the runtime
@@ -260,7 +266,7 @@ or the same-session selected-proposal checks.
 
 UserPromptSubmit resolves that workflow before any catalog scoring. A terse reply such as `OK`,
 `Go`, or `ok install it` can therefore accept the sole/selected plugin without rescoring the prompt.
-A trusted marketplace entry installs from that acceptance; an external entry writes a separate
+A trusted marketplace entry installs from that acceptance; an untrusted entry writes a separate
 content-bound nonce marker, after which confirmation routes only that exact `--confirm` command.
 Declines are recorded directly for only the selected proposal. Install/reload continuations and
 plugin questions stay inside the workflow, and the PreToolUse fallback also stays silent while it
@@ -279,52 +285,39 @@ state fails closed, and control language without valid state stays recommendatio
 
 The hook never performs an install. It does record a validated natural-language decline directly;
 the CLI independently revalidates accepted proposal, name, selected workflow, and source before an
-install, and revalidates the source-bound nonce when external confirmation is required.
+install, and revalidates the source-bound nonce when confirmation is required.
 
-## Trust posture: local vs. externally hosted
+## Trust posture
 
-The catalog no longer stores byte-level pins or an explicit trust flag. A plugin's assurance
-level is derived from the shape of its verbatim marketplace `source`:
+The catalog no longer stores byte-level pins or an explicit trust flag, and every entry is local:
+the catalog generator rejects any `source` that is not a non-empty relative-path string (see
+`plugin_catalog.py`'s `build_catalog`/`_validate_catalog`). A plugin's assurance level is still
+derived from the exact shape of its verbatim marketplace `source`, but the only distinction left is
+whether that string is the one reviewed path or not:
 
 - Only the **exact string** `./plugins/builder/<name>` is eligible for the accepted-proposal fast
   path. It identifies the same named plugin in the reviewed monorepo from which the registry was
   built. A merely relative string, mismatched directory, normalized/traversal variant, or future
   source form does not qualify.
-- An **object** `source` (e.g. `{ "source": "github", "repo": …, "ref": … }`) is fetched from
-  outside this repo at **install** time by `claude plugin install`. There is no build-time hook to
-  hash-verify that fetch, and installing a whole external plugin can run arbitrary hooks it ships —
-  an inherently lower assurance level. Rather than imply a byte-level guarantee it cannot deliver,
-  the external confirmation flow surfaces this as an explicit trust warning. A curated-allowlist
-  entry is trusted enough to install immediately **when the user accepts a proposal** (it skips the
-  confirmation flow entirely — see below), but a bare self-directed `plugin-install <name>` of that
-  same entry still previews its source and shows the trust warning: the allowlist certifies that the
-  user's *acceptance* authorizes the install, not that the external code is safe, so the warning
-  ("runs code and hooks this project does not control") stays honest wherever the preview renders.
-  The trust-warning guard in `_render_plugin_install_dry_run` is therefore shape-based
-  (`_plugin_install_is_same_marketplace`), never allowlist-based — trust is decided once, at the
-  install fork, and not duplicated in the display path. The pinned `ref`/`sha` in the source object
-  is recorded for provenance, not verification. Do not reintroduce a build-time tree
-  hash of an external repo: it would break the build's offline hermeticity and would only pin the
-  wrong moment.
+- Anything else — a mismatched path, a local entry outside `plugins/builder/` (e.g. an opted-in
+  `./plugins/internal/*` plugin, tracked separately as the W-24078663 gap), or a hypothetical future
+  mutable source form — is not byte-verified against a known-good identity, so the confirmation flow
+  surfaces this as an explicit trust warning rather than imply a guarantee it cannot deliver. The
+  trust-warning guard in `_render_plugin_install_dry_run` is shape-based
+  (`_plugin_install_is_same_marketplace`) — trust is decided once, at the install fork, and not
+  duplicated in the display path.
+
+There is no support in this codebase for installing a plugin from outside this repo (no
+externally-hosted/URL source, no per-entry marketplace routing, no curated allowlist of trusted
+external identities). If that capability is reintroduced later, do not reintroduce a build-time tree
+hash of an external repo as a substitute for review: it would break the build's offline hermeticity
+and would only pin the wrong moment.
 
 ### Which sources may skip the nonce (the trust predicate)
 
 `_plugin_install_is_trusted_source(name, entry)` is the single predicate that decides whether a
 source may be accepted with looser confirmation (the accepted-proposal fast path, a late bare
-affirmative, or an AskUserQuestion selection — see below). It grants trust on exactly two grounds,
-both **explicit**; trust is **never** inferred from source shape:
-
-1. the exact local source `./plugins/builder/<name>` (`_plugin_install_is_same_marketplace`), or
-2. an exact `(name, marketplace)` match in the small, reviewed in-code allowlist
-   `_TRUSTED_EXTERNAL_INSTALLS` — today just `("agentforce-adlc", "claude-plugins-official")`.
-
-The allowlist is keyed on the **routed** marketplace identity — the `<name>@<marketplace>` the
-install actually resolves. This is safe because an object-source install runs
-`claude plugin install <name>@<marketplace> --yes`, i.e. it fetches the plugin **by name from the
-genuine registry**; the catalog `url` is provenance/display only and is never fetched. So trusting
-the exact identity trusts precisely the install that will run. A future arbitrary external entry has
-a **different** name, so its `(name, "claude-plugins-official")` is absent from the set and it stays
-on the nonce + trust-warning path. Adding an entry is a deliberate, reviewed code change — not a
-catalog edit, and not a metadata flag. Routing (`_plugin_install_marketplace_name`) stays purely
-shape-based (W-24078663): shape chooses *where* to install from, the allowlist chooses *whether* to
-trust it, and the two are never conflated.
+affirmative, or an AskUserQuestion selection — see below). It grants trust on exactly one ground,
+**explicit**, never inferred from source shape alone: the exact local source
+`./plugins/builder/<name>` (`_plugin_install_is_same_marketplace`). Everything else stays on the
+nonce + trust-warning path.

@@ -4098,6 +4098,91 @@ class CommandPaintTests(unittest.TestCase):
         for painter in (sp, op, pp, wp):
             painter.assert_not_called()
 
+    def test_plugin_skill_commands_receive_their_lsp_hint_without_visible_paint(self):
+        cases = (
+            ("platform-apex-generate", "apex_diagnostics"),
+            ("platform-soql-query", "validate_soql"),
+        )
+        for skill, tool in cases:
+            with self.subTest(skill=skill):
+                code, result = self.capture(
+                    "", command_name=f"salesforce-development:{skill}")
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    result["hookSpecificOutput"]["hookEventName"],
+                    "UserPromptExpansion",
+                )
+                note = result["hookSpecificOutput"]["additionalContext"]
+                self.assertIn(tool, note)
+                if skill == "platform-soql-query":
+                    self.assertIn("handoff to `platform-data-manage`", note)
+                else:
+                    self.assertIn("existing Salesforce CLI", note)
+                self.assertNotIn("systemMessage", result)
+
+    def test_lsp_hint_does_not_attach_to_foreign_or_unqualified_commands(self):
+        for command_name in (
+            "other-plugin:platform-apex-generate",
+            "platform-soql-query",
+            "salesforce-development:platform-data-manage",
+        ):
+            with self.subTest(command_name=command_name):
+                code, result = self.capture("", command_name=command_name)
+                self.assertEqual((code, result), (0, {"continue": True}))
+
+
+class SkillDispatchLspHintTests(unittest.TestCase):
+    """The Skill-tool path receives the same plugin-runtime hint while preserving
+    the dispatch marker used by skills-first enforcement."""
+
+    def capture(self, skill):
+        payload = {"tool_input": {"skill": skill}, "session_id": "s", "prompt_id": "p"}
+        out = io.StringIO()
+        with mock.patch.object(sfx.sys, "stdin", io.StringIO(json.dumps(payload))), \
+                mock.patch.object(sfx, "_record_dispatched_skill") as record, \
+                redirect_stdout(out):
+            code = sfx.cmd_record_skill_dispatch()
+        return code, json.loads(out.getvalue()), record
+
+    def test_model_invoked_skills_receive_lsp_hint_and_still_record_dispatch(self):
+        cases = (
+            ("salesforce-development:platform-apex-generate", "apex_diagnostics"),
+            ("platform-soql-query", "validate_soql"),
+        )
+        for skill, tool in cases:
+            with self.subTest(skill=skill):
+                code, result, record = self.capture(skill)
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    result["hookSpecificOutput"]["hookEventName"], "PreToolUse")
+                self.assertIn(
+                    tool, result["hookSpecificOutput"]["additionalContext"])
+                if skill.endswith("platform-apex-generate"):
+                    self.assertIn(
+                        "refresh_org_schema",
+                        result["hookSpecificOutput"]["additionalContext"])
+                    self.assertIn(
+                        "One lookup per needed deferred LSP tool",
+                        result["hookSpecificOutput"]["additionalContext"])
+                else:
+                    self.assertIn(
+                        "handoff to `platform-data-manage`",
+                        result["hookSpecificOutput"]["additionalContext"])
+                record.assert_called_once()
+                self.assertEqual(record.call_args.args[1], skill.split(":")[-1])
+
+    def test_unrelated_skill_keeps_existing_silent_output(self):
+        code, result, record = self.capture(
+            "salesforce-development:platform-data-manage")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        record.assert_called_once()
+
+    def test_foreign_plugin_skill_keeps_existing_silent_output(self):
+        code, result, record = self.capture(
+            "other-plugin:platform-apex-generate")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        record.assert_called_once()
+
 
 class ResolvePositionAndOrgTests(unittest.TestCase):
     """`_resolve_position_and_org` resolves the org ONCE for the status surface and

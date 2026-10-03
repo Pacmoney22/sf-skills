@@ -67,3 +67,11 @@ def build_argv(resolved: str, args: Optional[list] = None) -> Optional[list]:
         comspec = os.environ.get("COMSPEC", "cmd.exe")
         return [comspec, "/c", resolved, *args]
     return [resolved, *args]
+
+
+def no_color_env() -> dict:
+    """Child env with color forced off. Claude Code exports FORCE_COLOR=3 to hook
+    processes, and `sf ... --json` then emits ANSI-colorized JSON even when piped, so
+    the JSON parse silently fails (forcedotcom/sf-skills#349). The bash deploy gate
+    sets the same two variables in sf_cli()."""
+    return {**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1"}

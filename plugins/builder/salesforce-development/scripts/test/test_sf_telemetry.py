@@ -149,6 +149,7 @@ PLAN_EVENTS = {
     "plugin_recommended": {"plugin", "origin", "confidence", "surface"},
     "plugin_installed": {"plugin", "origin", "confidence", "surface"},
     "plugin_install_result": {"plugin", "reason"},
+    "plugin_recommendation_configured": {"action", "level"},
     # feedback: the /feedback command's structured signal. rating is a numeric
     # 1-5. No free-text key, ever.
     "feedback": {"rating"},
@@ -583,6 +584,8 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
                 "plugin": "agentforce-adlc", "confidence": "none", "surface": "self-directed"}})
         self.capture("plugin_install_result", payload={"session_id": "S1", "tool_input": {
             "reason": "subprocess_failure"}})
+        self.capture("plugin_recommendation_configured", payload={
+            "session_id": "S1", "tool_input": {"action": "set", "level": "custom"}})
         self.capture("feedback", payload={"session_id": "S1", "tool_input": {
             "rating": 4}})
         self.capture("session_end", payload={"session_id": "S1"})
@@ -699,6 +702,43 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
                 "session_id": "S1", "tool_input": {"reason": unsafe}})
         self.assertEqual(len(self.events()), before,
                          "unknown/free-form install reasons must be dropped")
+
+    def test_plugin_recommendation_configured_accepts_closed_vocabularies_only(self):
+        # Validation is deliberately independent: capture owns two bounded
+        # vocabularies, while the command producer owns the meaningful mappings.
+        for action in sorted(sft._PLUGIN_RECOMMENDATION_ACTIONS):
+            for level in sorted(sft._PLUGIN_RECOMMENDATION_LEVELS):
+                with self.subTest(action=action, level=level):
+                    self.capture("plugin_recommendation_configured", payload={
+                        "session_id": "S1",
+                        "tool_input": {"action": action, "level": level},
+                    })
+                    self.assertEqual(
+                        self.last("plugin_recommendation_configured")["payload"],
+                        {"action": action, "level": level},
+                    )
+
+        before = len(self.events())
+        invalid = (
+            ("delete", "off"), (1, "off"), (None, "off"),
+            ("set", "4.2"), ("set", 4.2), ("set", None),
+        )
+        for action, level in invalid:
+            self.capture("plugin_recommendation_configured", payload={
+                "session_id": "S1", "tool_input": {"action": action, "level": level}})
+        self.assertEqual(len(self.events()), before,
+                         "unknown/non-string action or level must drop the entire event")
+
+    def test_plugin_recommendation_configured_drops_extra_raw_fields(self):
+        self.capture("plugin_recommendation_configured", payload={
+            "session_id": "S1", "tool_input": {
+                "action": "set", "level": "custom", "raw": "4.2",
+                "threshold": 4.2, "previous": "high", "path": "/Users/alice/.sf",
+                "prompt": "customer bug", "environment": "SECRET",
+            }})
+        event = self.last("plugin_recommendation_configured")
+        self.assertEqual(event["payload"], {"action": "set", "level": "custom"})
+        self.assertNotIn("4.2", json.dumps(event))
 
 
 class FeedbackEventTests(TelemetryCaptureTestBase):
@@ -1423,6 +1463,7 @@ class ConsentTests(TelemetryCaptureTestBase):
         self.assertIn("subagents", text)
         self.assertIn("mcp tools", text)
         self.assertIn("error categories", text)
+        self.assertIn("plugin recommendation setting", text)
         # The agent harness (which agent/editor ran the plugin) is now collected, so
         # the notice must disclose it too.
         self.assertIn("editor running the plugin", text)
@@ -1761,6 +1802,7 @@ class ManifestWiringTests(unittest.TestCase):
     _NEVER_HOOK_WIRED = {
         "plugin_loaded", "plugin_suggestion_declined",
         "plugin_recommended", "plugin_installed", "plugin_install_result",
+        "plugin_recommendation_configured",
         "feedback",
     }
 
@@ -1902,6 +1944,7 @@ class PdpMappingTests(TelemetryCaptureTestBase):
                               "confidence": "none", "surface": "self-directed"},
             "plugin_install_result": {"plugin": "agentforce-adlc",
                                       "reason": "subprocess_failure"},
+            "plugin_recommendation_configured": {"action": "set", "level": "custom"},
             "feedback": {"rating": 4},
         }
         produced = {}
@@ -1936,6 +1979,13 @@ class PdpMappingTests(TelemetryCaptureTestBase):
             "componentId": "agentforce-adlc",
             "contextName": "reason",
             "contextValue": "subprocess_failure",
+        })
+        self.assertEqual(produced["plugin_recommendation_configured"], {
+            "productFeatureId": "aJCEE000000SLW94AO",
+            "eventName": "pluginRecommendation.configured",
+            "componentId": "sensitivity",
+            "contextName": "action::level",
+            "contextValue": "set::custom",
         })
         # session.started keeps the model as componentId (original design) AND now
         # also carries it in the context tuple for a consistent model dimension.
@@ -1980,6 +2030,31 @@ class PdpMappingTests(TelemetryCaptureTestBase):
                 {"plugin": "alice@example.com", "reason": "unknown_plugin"},
             ))
         self.assertEqual(ev["componentId"], "unknown")
+
+    def test_plugin_recommendation_configured_is_revalidated_at_egress(self):
+        for payload in (
+            {"action": "set", "level": "4.2"},
+            {"action": "set", "level": 4.2},
+            {"action": "free text", "level": "low"},
+            {"action": None, "level": "off"},
+        ):
+            with self.subTest(payload=payload):
+                self.assertIsNone(sft._to_pdp_event(self._record(
+                    "plugin_recommendation_configured", payload)))
+
+    def test_plugin_recommendation_configured_wire_ignores_extra_fields(self):
+        record = self._record("plugin_recommendation_configured", {
+            "action": "set", "level": "custom", "raw": "4.2",
+            "threshold": 4.2, "previous": "high", "path": "/Users/alice/.sf",
+        })
+        wire = {
+            "pdp": self._pdp(record),
+            "uip": sft._to_a4d_event(record),
+        }
+        serialized = json.dumps(wire)
+        self.assertNotIn("4.2", serialized)
+        self.assertNotIn("previous", serialized)
+        self.assertNotIn("/Users/", serialized)
 
     def test_unknown_record_is_skipped(self):
         self.assertIsNone(sft._to_pdp_event({"event": "not_real", "payload": {}}))
@@ -2345,6 +2420,7 @@ class GoldenWireShapeTests(unittest.TestCase):
                             "subcommand": "status-org", "outcome": "success"},
         "plugin_install_result": {"plugin": "agentforce-adlc",
                                   "reason": "subprocess_failure"},
+        "plugin_recommendation_configured": {"action": "set", "level": "custom"},
         "skill_dispatched": {"skill": "platform-apex-generate", "skill_domain": "platform"},
         "agent_dispatched": {"agent_type": "code-review"},
         "exception": {"error_class": "rate_limit", "kind": "api_error"},
@@ -2372,6 +2448,11 @@ class GoldenWireShapeTests(unittest.TestCase):
                 "productFeatureId": self.PFID, "eventName": "pluginInstall.completed",
                 "componentId": "agentforce-adlc",
                 "contextName": "reason", "contextValue": "subprocess_failure"},
+            "plugin_recommendation_configured": {
+                "productFeatureId": self.PFID,
+                "eventName": "pluginRecommendation.configured",
+                "componentId": "sensitivity",
+                "contextName": "action::level", "contextValue": "set::custom"},
             "skill_dispatched": {
                 "productFeatureId": self.PFID, "eventName": "skill.dispatched",
                 "componentId": "platform-apex-generate",
@@ -2418,6 +2499,9 @@ class GoldenWireShapeTests(unittest.TestCase):
                 "commandSurface": "user"}},
             "plugin_install_result": {"eventName": "pluginInstall.completed", "attributes":
                 self._uip_common("agentforce-adlc", "reason", "subprocess_failure")},
+            "plugin_recommendation_configured": {
+                "eventName": "pluginRecommendation.configured", "attributes":
+                self._uip_common("sensitivity", "action::level", "set::custom")},
             "skill_dispatched": {"eventName": "skill.dispatched", "attributes": {
                 **self._uip_common("platform-apex-generate", "skill_domain", "platform"),
                 "skillName": "platform-apex-generate",
@@ -2625,6 +2709,22 @@ class OrgCacheTests(TelemetryCaptureTestBase):
         self.assertNotIn("org_id", cached, "raw org id must never be cached")
         self.assertNotIn("00Dxx0000000001", json.dumps(cached))
         self.assertEqual(set(cached.keys()), {"org_bucket", "username"})
+
+    def test_resolve_forces_color_off_in_sf_child_env(self):
+        # #349: FORCE_COLOR inherited from Claude Code colorizes `sf --json`, the
+        # parse fails silently, and the org bucket/id drop out of telemetry.
+        self._org.stop()
+        proc = mock.Mock()
+        proc.stdout = json.dumps({"result": {"orgId": "00Dxx0000000001"}})
+        with mock.patch.dict(sft.os.environ, {"FORCE_COLOR": "3"}), \
+                mock.patch.object(sft, "_sf_command",
+                                  return_value=["sf", "org", "display", "--json"]), \
+                mock.patch.object(sft.subprocess, "run", return_value=proc) as run:
+            sft._resolve_org_context()
+        self._org.start()
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["FORCE_COLOR"], "0")
+        self.assertEqual(env["NO_COLOR"], "1")
 
     def test_org_context_read_reports_empty_org_id(self):
         # Even if a stale cache somehow held an org_id, the reader zeroes it — the

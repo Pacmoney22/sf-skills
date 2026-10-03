@@ -13,8 +13,8 @@ The script below contains several `<...>` placeholders. Replace them with concre
 - **`<agent_label_placeholder>`** → user-facing label, e.g. *"Help Agent"*.
 - **`<developer_name_placeholder>`** → API name. Use `HelpAgent_Demo` or similar valid Salesforce developer-name format (alphanumeric + underscore, no spaces, no leading digit).
 - **`<default_agent_user_placeholder>`** → the dedicated Einstein Agent User created in the readiness check (step 1). Username is `{agentDevName}_user@{orgId}.ext`. This is the user the agent runs as at runtime — do not substitute any other Einstein Agent User that happens to exist in the org.
-- **`<rag_feature_config_id>`** (under `knowledge:`) → returned by `agentforce-adlc:agentforce-generate` when the ADL is created. Wire it through; do not hardcode.
-  - **Format:** `ARFPC_<libraryId>` where `<libraryId>` is the 18-char Salesforce ID returned by `adl create`. The ID does **not** appear in `adl get` output — it only surfaces in the `adl publish` error message when a publish fails against a mismatched ID. If you need to reconstruct it manually, take the library ID from `adl create` and prefix it with `ARFPC_`. `agentforce-adlc:agentforce-generate` already knows this shape; only reach for the manual form when debugging.
+- **`<rag_feature_config_id>`** (under `knowledge:`) → returned by `agentforce-generate` when the ADL is created. Wire it through; do not hardcode.
+  - **Format:** `ARFPC_<libraryId>` where `<libraryId>` is the 18-char Salesforce ID returned by `adl create`. The ID does **not** appear in `adl get` output — it only surfaces in the `adl publish` error message when a publish fails against a mismatched ID. If you need to reconstruct it manually, take the library ID from `adl create` and prefix it with `ARFPC_`. `agentforce-generate` already knows this shape; only reach for the manual form when debugging.
 - **`<gc:languageSettings_language>`** (under `language: default_locale`) → the org's default locale, usually `en_US`. Resolve from org settings, do not hardcode.
 
 ## Agent shape at a glance

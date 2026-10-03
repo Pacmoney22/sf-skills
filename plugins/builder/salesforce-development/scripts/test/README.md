@@ -41,9 +41,10 @@ the TypeScript source that such tests would exercise.
 
 ## Deploy gate — `sf-deploy-gate` (issue #259)
 
-**`classify.test.sh`** — feeds `sf org display --json` fixtures into
-`sf-deploy-gate classify` and asserts the bucket
-(`production|sandbox|scratch|trial|devhub|unknown`). The headline cases are the
+**`classify.test.sh`** — feeds `sf org list` record / `sf org display --json`
+fixtures into `sf-deploy-gate classify` and asserts the bucket
+(`production|sandbox|scratch|trial|unknown`). A Dev Hub with no sandbox, scratch,
+or trial signal is production. The headline cases are the
 trial/dev orgs that were previously mis-classified as production:
 
 - OrgFarm trials (`orgfarm-*`, `*.develop.my.salesforce.com`) with `isSandbox`/
@@ -219,10 +220,9 @@ drift** section (advisory — never gates, never part of `--check`). Plugin matc
 scores only your curated marketplace text (description / keywords / examplePrompts),
 never the skills your plugin actually ships, so that text can silently fall out of
 sync: add a capability skill and forget to advertise it, and users can never be
-routed to the plugin for it. The drift check flags, for every **local** plugin, any
+routed to the plugin for it. The drift check flags, for every plugin, any
 shipped skill that shares no token with any of the matcher text — a skill with no
-token in common is one the scorer can never route a user to
-(external/git-URL plugins are reported as *skipped*, never a false warning). It is
+token in common is one the scorer can never route a user to. It is
 advisory in the report, but the real-repo case is asserted as a regression gate in
 `test_plugin_match_coverage.py` (`test_real_repo_local_plugins_have_no_drift`) — so
 a shipped skill that no match text represents turns the gate red. Close a warning by

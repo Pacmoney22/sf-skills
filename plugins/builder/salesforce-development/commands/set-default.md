@@ -15,9 +15,10 @@ Workflow:
 
 2. **List the authenticated orgs:**
    ```bash
-   sf org list --json
+   sf org list --skip-connection-status --json
    ```
-   - **If no org was named:** present the authenticated orgs as a short numbered list (alias · username · status) and ask which one to set as the default. Use the org they choose as `<alias>` below. If the list is empty, tell the user to authenticate first via `/salesforce-development:login --alias <name>` (a browser login), then stop.
+   `--skip-connection-status` avoids a token refresh for every authenticated org; step 4 checks the chosen org's connection.
+   - **If no org was named:** present the authenticated orgs as a short numbered list (alias · username) and ask which one to set as the default. Use the org they choose as `<alias>` below. If the list is empty, tell the user to authenticate first via `/salesforce-development:login --alias <name>` (a browser login), then stop.
    - **If an org was named:** confirm the alias/username appears in the list. If not, tell the user to authenticate first via `/salesforce-development:login --alias <name>`.
 
 3. **Set the target-org:**

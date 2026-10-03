@@ -14,7 +14,7 @@ Workflow:
    - `--all` → log out of every authenticated org
    - No arguments → list current orgs and ask which to log out of
 
-2. **If no arguments:** call `sf org list --json`, present the orgs in a numbered list, and ask the user which to log out of.
+2. **If no arguments:** call `sf org list --skip-connection-status --json` (skip the per-org token refresh), present the orgs in a numbered list, and ask the user which to log out of.
 
 3. **Confirm before action:** show the alias(es) about to be logged out and require explicit "yes" confirmation. This is destructive and the user will need to re-authenticate to use the org again.
 

@@ -2,16 +2,12 @@
   "schemaVersion": "1.0",
   "generatedFrom": {
     "marketplace": ".claude-plugin/marketplace.json",
-    "marketplaceSha256": "ec4b1fa21cffa9fa97d69497f85d9c4d865e6d8fbe37ece780aea229a2947b2d"
+    "marketplaceSha256": "e8a64b48c285c2f1eec015baac0a4fbce3bf1edadfe29f4fcdb5650b348981cd"
   },
   "plugins": [
     {
       "name": "agentforce-adlc",
-      "source": {
-        "source": "url",
-        "url": "https://github.com/SalesforceAIResearch/agentforce-adlc.git",
-        "ref": "main"
-      },
+      "source": "./plugins/builder/agentforce-adlc",
       "match": {
         "description": "Author, discover, scaffold, deploy, test, secure, and optimize Agentforce .agent files",
         "keywords": [

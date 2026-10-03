@@ -21,6 +21,42 @@ dashboard.
 The recommended dashboard label is **Unique plugin-session recommendations shown**. It matches the
 deduplicated query and describes the metric more usefully than preserving the old near-raw value.
 
+## Recommendation-setting changes
+
+Successful preference mutations made through
+`/salesforce-development:plugin-recommendations` emit the internal event
+`plugin_recommendation_configured`, projected to PDP/UIP as
+`pluginRecommendation.configured` with `componentId = 'sensitivity'`,
+`contextName = 'action::level'`, and `contextValue = '<action>::<level>'`.
+
+The action vocabulary is `disable`, `reset`, and `set`; the level vocabulary is `off`, `default`,
+`low`, `standard`, `high`, and `custom`. `off` and `set off` both produce `disable::off`; `on`
+produces `reset::default`; named `set` values retain their level; numeric thresholds produce
+`set::custom`. The exact custom number, raw argument, previous value, preference path, prompt, and
+environment values are never captured.
+
+This event measures successful slash-command actions only. It does not observe native `userConfig`
+or environment-variable changes, and a saved choice can be masked by a higher-precedence environment
+setting. `reset` means the saved override was cleared so resolution returns to the plugin/install
+default; it does not mean the command forced `standard`. Repeated successful commands produce
+repeated events.
+
+For user-choice metrics, count distinct `machine_id`; raw row counts measure actions, not users:
+
+```sql
+SELECT
+  recommendation_setting_action,
+  recommendation_setting_level,
+  approx_distinct(machine_id) AS unique_users
+FROM events
+WHERE event_name = 'pluginRecommendation.configured'
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+Use `COUNT(*) AS configuration_actions` over the same grouping only when the dashboard is explicitly
+labelled as action volume.
+
 ## Producer result reasons
 
 `pluginInstall.completed` has the catalog-validated plugin name as `componentId`,

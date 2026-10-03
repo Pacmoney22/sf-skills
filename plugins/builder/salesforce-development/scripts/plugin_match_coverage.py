@@ -281,11 +281,10 @@ def report_to_dict(report: CoverageReport, drift: Optional[list] = None) -> dict
     if drift is not None:
         # Advisory only -- never reflected in summary.clean.
         snapshot["drift"] = {
-            "driftingPlugins": [d.name for d in drift if d.is_local and d.unrepresented],
+            "driftingPlugins": [d.name for d in drift if d.unrepresented],
             "plugins": [
                 {
                     "name": d.name,
-                    "isLocal": d.is_local,
                     "skillCount": d.skill_count,
                     "unrepresented": list(d.unrepresented),
                     "note": d.note,
@@ -367,9 +366,9 @@ def format_report(report: CoverageReport) -> str:
 # the skills it ships (add a capability skill, forget to advertise it; delete a
 # skill, keep advertising it). Nothing lexically ties the two, so this section
 # flags the drift as a warning. It is deterministic and lexical (reusing the
-# matcher's own `_tokenize`/`_plugin_document_tokens`), and it can only inspect
-# LOCAL plugins whose skills live in this repo -- external (git-url/object-source)
-# plugins are reported as skipped, never silently.
+# matcher's own `_tokenize`/`_plugin_document_tokens`), and it inspects every
+# plugin's skills directly since every catalog entry is local (a relative path
+# in this repo -- see plugin_catalog.py's build_catalog/_validate_catalog).
 _FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---", re.DOTALL)
 _YAML_SCALAR_RE = re.compile(r"^(name|description)\s*:\s*(.+?)\s*$")
 _MAX_SKILL_MD_BYTES = 1024 * 1024
@@ -377,16 +376,14 @@ _MAX_SKILL_MD_BYTES = 1024 * 1024
 
 class SkillDrift(NamedTuple):
     name: str
-    is_local: bool          # source is a relative path in this repo (vs. an external object)
     skill_count: int
     unrepresented: tuple    # skill dir names sharing no token with the match text
-    note: str               # populated for skipped/empty cases, else ""
+    note: str               # populated for empty cases, else ""
 
 
 def _skill_dir_for(source, repo_root: Path) -> Optional[Path]:
-    """The on-disk ``skills/`` dir for a LOCAL plugin source, else None. Returns
-    None both for an external (object) source and for a local source that ships
-    no ``skills/`` dir -- the caller distinguishes the two via ``is_local``."""
+    """The on-disk ``skills/`` dir for a plugin's local source, else None if it
+    ships no ``skills/`` dir."""
     if not (isinstance(source, str) and source):
         return None
     skills_dir = (repo_root / source.lstrip("./")) / "skills"
@@ -413,19 +410,15 @@ def _read_frontmatter_terms(skill_md: Path) -> str:
 
 
 def _drift_for_plugin(plugin: dict, repo_root: Path) -> SkillDrift:
-    """One plugin's drift: for a LOCAL plugin, the shipped skills that share no
-    token with any of its matcher text. External sources
-    are skipped (their skills are not in this repo); a local plugin that ships no
-    ``skills/`` dir is local-but-empty (still not a false external skip)."""
+    """One plugin's drift: the shipped skills that share no token with any of
+    its matcher text. A plugin that ships no ``skills/`` dir is empty, not
+    drifting."""
     name = plugin.get("name")
     source = plugin.get("source")
-    is_local = isinstance(source, str) and bool(source)
-    if not is_local:
-        return SkillDrift(name, False, 0, (), "external source -- skills not in this repo, skipped")
 
     skills_dir = _skill_dir_for(source, repo_root)
     if skills_dir is None:
-        return SkillDrift(name, True, 0, (), "local plugin ships no skills/ directory")
+        return SkillDrift(name, 0, (), "plugin ships no skills/ directory")
 
     match_vocab = set(catalog_mod._plugin_document_tokens(plugin))
 
@@ -447,7 +440,7 @@ def _drift_for_plugin(plugin: dict, repo_root: Path) -> SkillDrift:
             unrepresented.append(skill_dir.name)
 
     note = "" if skill_dirs else "no skills found on disk"
-    return SkillDrift(name, True, len(skill_dirs), tuple(unrepresented), note)
+    return SkillDrift(name, len(skill_dirs), tuple(unrepresented), note)
 
 
 def compute_drift(catalog_data: dict, repo_root: Path, *, foundation: str = FOUNDATION_PLUGIN) -> list:
@@ -464,15 +457,12 @@ def compute_drift(catalog_data: dict, repo_root: Path, *, foundation: str = FOUN
 def format_drift(rows: list) -> str:
     """Human-readable drift section (advisory)."""
     lines = []
-    local = [r for r in rows if r.is_local]
-    external = [r for r in rows if not r.is_local]
-    drifting = [r for r in local if r.unrepresented]
+    drifting = [r for r in rows if r.unrepresented]
 
     lines.append("")
     lines.append(
         f"Match-text vs. shipped-skills drift (advisory): "
-        f"{len(local) - len(drifting)}/{len(local)} local plugins aligned"
-        + (f", {len(external)} external plugin(s) skipped" if external else "")
+        f"{len(rows) - len(drifting)}/{len(rows)} plugins aligned"
     )
     if drifting:
         lines.append("")
@@ -482,10 +472,6 @@ def format_drift(rows: list) -> str:
                     f"  ⚠ {row.name}: skill {skill!r} ships but shares no token with any "
                     f"matcher text -- the plugin cannot be recommended for it"
                 )
-    if external:
-        lines.append("")
-        for row in external:
-            lines.append(f"  – {row.name}: {row.note}")
     lines.append("")
     lines.append(
         "Drift is advisory: a skill edit can never change a match score (matching scores "

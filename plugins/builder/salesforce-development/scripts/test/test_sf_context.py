@@ -271,6 +271,34 @@ class RunTests(unittest.TestCase):
             sfx.run(["sf", "version"])
         self.assertEqual(captured["timeout"], 10)
 
+    def test_run_forces_color_off_in_child_env(self):
+        # forcedotcom/sf-skills#349: Claude Code exports FORCE_COLOR=3 to hooks, which makes
+        # `sf ... --json` emit ANSI-colorized JSON that parse_json() can't read. The child env
+        # must override it without mutating our own environment.
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _completed(stdout="{}", returncode=0)
+
+        with mock.patch.object(sfx, "resolve_executable", return_value="/usr/local/bin/sf"), \
+                mock.patch.dict(sfx.os.environ, {"FORCE_COLOR": "3", "SF_KEEP": "1"}, clear=False), \
+                mock.patch.object(sfx.subprocess, "run", side_effect=fake_run):
+            sfx.run(["sf", "org", "list", "--json"])
+            self.assertEqual(sfx.os.environ["FORCE_COLOR"], "3")
+        self.assertEqual(captured["env"]["FORCE_COLOR"], "0")
+        self.assertEqual(captured["env"]["NO_COLOR"], "1")
+        self.assertEqual(captured["env"]["SF_KEEP"], "1")
+
+
+class OrgListTests(unittest.TestCase):
+    def test_org_list_skips_connection_status(self):
+        # forcedotcom/sf-skills#349: a bare `sf org list` makes one refresh-token request per
+        # authenticated org; from an unattended hook that has locked users out of orgs.
+        with mock.patch.object(sfx, "run", return_value='{"result": {"nonScratchOrgs": []}}') as run:
+            self.assertEqual(sfx.get_org_list(), {"nonScratchOrgs": []})
+        run.assert_called_once_with(["sf", "org", "list", "--skip-connection-status", "--json"])
+
 
 class PlatformTuningTests(unittest.TestCase):
     def test_cli_timeout_scales_on_windows(self):
@@ -3118,6 +3146,83 @@ class CmdPluginMatchConfigTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Plugin recommendation sensitivity", out.getvalue())
 
+    def test_successful_mutations_emit_closed_configuration_mappings(self):
+        cases = (
+            (["off"], "disable", "off"),
+            (["set", "off"], "disable", "off"),
+            (["on"], "reset", "default"),
+            (["set", "low"], "set", "low"),
+            (["set", "standard"], "set", "standard"),
+            (["set", "high"], "set", "high"),
+            (["set", "4.2"], "set", "custom"),
+        )
+        for args, action, level in cases:
+            with self.subTest(args=args), \
+                    mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as emit, \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(sfx.cmd_plugin_match_config(args), 0)
+                emit.assert_called_once_with(action, level)
+
+    def test_read_only_and_invalid_paths_emit_nothing(self):
+        for args in ([], ["status"], ["set"], ["set", "extreme"], ["bogus"]):
+            with self.subTest(args=args), \
+                    mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as emit, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                sfx.cmd_plugin_match_config(args)
+                emit.assert_not_called()
+
+    def test_failed_persistence_emits_nothing(self):
+        for args, persistence in ((["off"], "_save_plugin_match_override"),
+                                  (["set", "low"], "_save_plugin_match_override"),
+                                  (["on"], "_clear_plugin_match_override")):
+            with self.subTest(args=args), \
+                    mock.patch.object(sfx, persistence, return_value=False), \
+                    mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as emit, \
+                    redirect_stderr(io.StringIO()):
+                self.assertEqual(sfx.cmd_plugin_match_config(args), 1)
+                emit.assert_not_called()
+
+    def test_telemetry_failure_does_not_change_success_output_or_persistence(self):
+        class _RaisingTelemetry:
+            @staticmethod
+            def capture_event(*_args, **_kwargs):
+                raise RuntimeError("telemetry unavailable")
+
+        with mock.patch.object(sfx, "_fire_plugin_recommendation_configured"), \
+                redirect_stdout(io.StringIO()) as out:
+            expected_rc = sfx.cmd_plugin_match_config(["set", "4.2"])
+            expected_output = out.getvalue()
+
+        loader_cases = (
+            {"side_effect": RuntimeError("telemetry loader unavailable")},
+            {"return_value": _RaisingTelemetry},
+        )
+        for loader_case in loader_cases:
+            with self.subTest(loader_case=loader_case), \
+                    mock.patch.object(sfx, "_load_sf_telemetry", **loader_case), \
+                    redirect_stdout(io.StringIO()) as out:
+                rc = sfx.cmd_plugin_match_config(["set", "4.2"])
+            self.assertEqual(rc, expected_rc)
+            self.assertEqual(out.getvalue(), expected_output)
+            self.assertEqual(sfx._load_plugin_match_override(), 4.2)
+
+    def test_configuration_emitter_uses_session_and_only_canonical_fields(self):
+        seen = []
+
+        class _Telemetry:
+            @staticmethod
+            def capture_event(event, outcome, payload):
+                seen.append((event, outcome, payload))
+
+        with mock.patch.object(sfx, "_load_sf_telemetry", return_value=_Telemetry), \
+                mock.patch.object(sfx, "_plugin_session_id", return_value="session-1"):
+            sfx._fire_plugin_recommendation_configured("set", "custom")
+        self.assertEqual(seen, [(
+            "plugin_recommendation_configured", "",
+            {"tool_input": {"action": "set", "level": "custom"},
+             "session_id": "session-1"},
+        )])
+
 
 class PluginCatalogMatchTests(unittest.TestCase):
     """Phase 3: `_plugin_catalog_match` (the shared matching-service entry point
@@ -4855,19 +4960,16 @@ class PluginInstallTelemetryTests(unittest.TestCase):
         install.assert_called_once_with(name, entry, session_id)
         self.assertIsNone(sfx._load_plugin_install_pending(session_id))
 
-    def test_accepted_non_allowlisted_external_proposal_requires_source_confirmation(self):
-        # A url/object source whose (name, marketplace) identity is NOT in the
-        # curated _TRUSTED_EXTERNAL_INSTALLS allowlist stays on the nonce + TRUST
-        # WARNING path -- trust is an explicit allowlist, never inferred from the
-        # source shape (routing to claude-plugins-official does not grant trust).
+    def test_accepted_proposal_with_mismatched_source_requires_confirmation(self):
+        # A source that is not the exact `./plugins/builder/<name>` match stays
+        # on the nonce + TRUST WARNING path -- trust is never inferred from
+        # source shape alone (_plugin_install_is_same_marketplace).
         name = "acme-data-loader"
-        session_id = "sess-external-accept"
+        session_id = "sess-mismatched-accept"
         entry = {
             "source": {"source": "url", "url": "https://example.test/plugin.git"},
-            "origin": "external",
         }
-        self.assertNotIn(
-            (name, "claude-plugins-official"), sfx._TRUSTED_EXTERNAL_INSTALLS)
+        self.assertFalse(sfx._plugin_install_is_same_marketplace(name, entry))
         self.assertTrue(sfx._save_plugin_proposals(
             session_id,
             {name: {"confidence": "high", "surface": "user-prompt"}},
@@ -4886,47 +4988,11 @@ class PluginInstallTelemetryTests(unittest.TestCase):
         install.assert_not_called()
         rendered = stdout.getvalue()
         self.assertIn("TRUST WARNING", rendered)
-        # The confirmation must state the real install target (the official
-        # marketplace), not just the bundled url source, so the user confirms
-        # what actually installs.
-        self.assertIn(f"Installs from: {name}@claude-plugins-official", rendered)
+        self.assertIn(f"Installs from: {name}@salesforce", rendered)
         pending = sfx._load_plugin_install_pending(session_id)
         self.assertEqual(pending["name"], name)
         self.assertEqual(sfx._load_plugin_flow(session_id)["state"], "awaiting-confirmation")
         self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "previewed")
-
-    def test_accepted_allowlisted_external_proposal_installs_in_one_call(self):
-        # agentforce-adlc@claude-plugins-official is the one curated external
-        # identity in _TRUSTED_EXTERNAL_INSTALLS: an accepted proposal installs
-        # immediately (no nonce, no TRUST WARNING), exactly like a local entry --
-        # the install resolves that plugin BY NAME from the genuine official
-        # marketplace, so trusting the exact identity trusts exactly what runs.
-        name = "agentforce-adlc"
-        session_id = "sess-allowlisted-accept"
-        entry = {
-            "source": {"source": "url", "url": "https://example.test/plugin.git"},
-            "origin": "external",
-        }
-        self.assertIn(
-            (name, "claude-plugins-official"), sfx._TRUSTED_EXTERNAL_INSTALLS)
-        self.assertTrue(sfx._save_plugin_proposals(
-            session_id,
-            {name: {"confidence": "high", "surface": "user-prompt"}},
-        ))
-        self.assertTrue(sfx._save_plugin_flow(
-            session_id, [name], selected=name, state="selected",
-            surface="user-prompt", task_backed=True,
-        ))
-        with mock.patch.object(
-                sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
-                mock.patch.object(sfx, "_perform_plugin_install", return_value=0) as install, \
-                redirect_stdout(io.StringIO()) as stdout:
-            self.assertEqual(sfx.cmd_plugin_install([
-                name, "--accept-proposed", "--session-id", session_id,
-            ]), 0)
-        install.assert_called_once_with(name, entry, session_id)
-        self.assertNotIn("TRUST WARNING", stdout.getvalue())
-        self.assertIsNone(sfx._load_plugin_install_pending(session_id))
 
     def test_accept_proposed_refuses_without_selected_same_session_flow(self):
         name = "experience-react"
@@ -5316,29 +5382,22 @@ class PluginInstallTelemetryTests(unittest.TestCase):
 class PluginTrustedSourceGateTests(unittest.TestCase):
     """`_plugin_install_is_trusted_source` -- the single predicate that decides
     which sources may be accepted with looser confirmation. Trust is granted only
-    by the exact local source OR an exact (name, marketplace) entry in the curated
-    _TRUSTED_EXTERNAL_INSTALLS allowlist; it is NEVER inferred from source shape.
-    Also covers the consent openings _plugin_install_route_note emits."""
+    by the exact local `./plugins/builder/<name>` source
+    (_plugin_install_is_same_marketplace); it is NEVER inferred from source
+    shape alone. Also covers the consent openings _plugin_install_route_note
+    emits."""
 
     def test_local_exact_builder_source_is_trusted(self):
         name = "experience-react"
         self.assertTrue(sfx._plugin_install_is_trusted_source(
             name, {"source": f"./plugins/builder/{name}"}))
 
-    def test_allowlisted_external_identity_is_trusted(self):
-        # agentforce-adlc routes to claude-plugins-official (url source) and that
-        # exact identity is allowlisted, so it is trusted.
-        name = "agentforce-adlc"
-        entry = {"source": {"source": "url", "url": "https://example.test/p.git"}}
-        self.assertIn((name, "claude-plugins-official"), sfx._TRUSTED_EXTERNAL_INSTALLS)
-        self.assertTrue(sfx._plugin_install_is_trusted_source(name, entry))
-
-    def test_non_allowlisted_external_identity_is_not_trusted(self):
-        # A different external name routes to the same official marketplace but is
-        # NOT allowlisted -- shape (url -> official) must never grant trust.
+    def test_mismatched_source_is_not_trusted(self):
+        # A source that does not match the exact ./plugins/builder/<name> path
+        # -- including a non-string source -- is never trusted, regardless of
+        # what marketplace it would route to.
         name = "acme-data-loader"
         entry = {"source": {"source": "url", "url": "https://example.test/p.git"}}
-        self.assertNotIn((name, "claude-plugins-official"), sfx._TRUSTED_EXTERNAL_INSTALLS)
         self.assertFalse(sfx._plugin_install_is_trusted_source(name, entry))
 
     def test_local_string_source_outside_builder_is_not_trusted(self):
@@ -5767,13 +5826,10 @@ class PluginPostAskQuestionBridgeTests(unittest.TestCase):
 
 
 class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
-    """Source-aware install routing and installed-mode marketplace registration.
+    """Install routing and installed-mode marketplace registration.
 
-    Routing keys off the catalog source *shape*: any local string source
-    (`./plugins/...`) installs from the "salesforce" marketplace (which the
-    installer registers on demand in installed mode); an external url/object
-    source (agentforce-adlc) installs from the pre-registered official
-    marketplace with no registration step."""
+    Every catalog entry is local, so install always routes to the "salesforce"
+    marketplace, which the installer registers on demand in installed mode."""
 
     def setUp(self):
         result_patch = mock.patch.object(sfx, "_fire_plugin_install_result")
@@ -5786,20 +5842,13 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
         self.assertEqual(sfx._plugin_install_marketplace_name(name, entry), "salesforce")
 
     def test_marketplace_name_is_salesforce_for_local_source_outside_builder(self):
-        # Routing keys off source *shape* (string = local), not the strict
-        # `./plugins/builder/<name>` trust predicate. A local entry elsewhere in
-        # the tree (e.g. an opted-in `./plugins/internal/*`) is still in the
-        # "salesforce" marketplace and must not misroute to the official one.
+        # A local entry elsewhere in the tree (e.g. an opted-in
+        # `./plugins/internal/*` plugin) is still in the "salesforce"
+        # marketplace (the W-24078663 gap noted on
+        # _plugin_install_marketplace_name is about publication, not routing).
         name = "skill-platform"
         entry = {"source": f"./plugins/internal/{name}"}
         self.assertEqual(sfx._plugin_install_marketplace_name(name, entry), "salesforce")
-
-    def test_marketplace_name_is_official_for_external_url_source(self):
-        name = "agentforce-adlc"
-        entry = {"source": {"source": "url", "url": "https://example.test/plugin.git"}}
-        self.assertEqual(
-            sfx._plugin_install_marketplace_name(name, entry), "claude-plugins-official"
-        )
 
     def test_perform_install_routes_local_source_through_salesforce_and_registers(self):
         name = "experience-react"
@@ -5819,50 +5868,6 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
         reg.assert_called_once()
         argv = run_step.call_args_list[0].args[0]
         self.assertEqual(argv, ["claude", "plugin", "install", f"{name}@salesforce", "--yes"])
-
-    def test_perform_install_routes_external_source_through_official_without_registering(self):
-        name = "agentforce-adlc"
-        entry = {
-            "source": {"source": "url", "url": "https://example.test/plugin.git"},
-            "origin": "external",
-        }
-        with mock.patch.object(sfx, "_ensure_salesforce_marketplace_registered") as reg, \
-                mock.patch.object(
-                    sfx, "_run_plugin_install_step", return_value=(True, {"exitCode": 0})
-                ) as run_step, \
-                mock.patch.object(sfx, "_select_plugin_flow"), \
-                mock.patch.object(sfx, "_plugin_install_fire_installed"), \
-                mock.patch.object(sfx, "_plugin_install_fire_loaded"), \
-                mock.patch.object(sfx, "_clear_plugin_install_pending"), \
-                mock.patch.object(sfx, "_load_plugin_flow", return_value=None), \
-                redirect_stdout(io.StringIO()):
-            self.assertEqual(sfx._perform_plugin_install(name, entry, "sess-external"), 0)
-        self.result.assert_called_once_with("installed", "sess-external", name)
-        reg.assert_not_called()
-        argv = run_step.call_args_list[0].args[0]
-        self.assertEqual(
-            argv, ["claude", "plugin", "install", f"{name}@claude-plugins-official", "--yes"]
-        )
-
-    def test_perform_install_failure_names_the_targeted_marketplace(self):
-        name = "agentforce-adlc"
-        entry = {"source": {"source": "url", "url": "https://example.test/plugin.git"}}
-        with mock.patch.object(sfx, "_ensure_salesforce_marketplace_registered"), \
-                mock.patch.object(
-                    sfx, "_run_plugin_install_step",
-                    return_value=(False, {"exitCode": 1, "timedOut": False}),
-                ), \
-                redirect_stderr(io.StringIO()) as stderr:
-            self.assertEqual(sfx._perform_plugin_install(name, entry, "sess-fail"), 3)
-        self.result.assert_called_once_with("subprocess_failure", "sess-fail", name)
-        err = stderr.getvalue()
-        self.assertIn("claude-plugins-official", err)
-        # The stale/unregistered remediation is wrong for the pre-registered
-        # official marketplace and must not be offered there.
-        self.assertNotIn("marketplace update", err)
-        # The official marketplace can be absent (fresh config dir, non-interactive
-        # startup); name its one-time registration remediation.
-        self.assertIn("marketplace add anthropics/claude-plugins-official", err)
 
     def test_perform_install_failure_names_salesforce_and_offers_remediation(self):
         name = "experience-react"

@@ -8,22 +8,26 @@
 #   auto-deploy  - Opt-in (SFDX_AUTO_DEPLOY=1) deploy of a just-saved source file to a
 #                  NON-production org (PostToolUse on Edit/Write under force-app/**).
 #                  No-ops silently on prod/unknown orgs or when the feature is off.
-#   classify     - Read `sf org display --json` output on stdin and print the org bucket
-#                  (production|sandbox|scratch|trial|devhub|unknown). Pure function, no
+#   bucket <org> - Print the bucket for an org alias, username, or org ID, resolved the
+#                  same way the hooks do (org list record, else org display). Skills
+#                  call this rather than piping `sf org display` into `classify`.
+#   classify     - Read an `sf org list` record or `sf org display --json` output (both as
+#                  {"result": {...}}) on stdin and print the org bucket
+#                  (production|sandbox|scratch|trial|unknown). Pure function, no
 #                  network — used by the gate and by the offline classification test.
 
 set -uo pipefail
 
 # --- Org classification ------------------------------------------------------
-# Pure classifier: reads `sf org display --json` shape on stdin, prints one bucket.
+# Pure classifier: reads a {"result": <org>} document on stdin, prints one bucket.
 # Kept as a standalone python block so it can be exercised offline with fixtures
 # (see test/classify.test.sh) without a live org.
 #
-# Buckets: production | sandbox | scratch | trial | devhub | unknown
+# Buckets: production | sandbox | scratch | trial | unknown
 # Only `production` is gated; everything else is a non-prod target.
 classify_org_json() {
   python3 -c "
-import json, sys
+import datetime, json, sys
 try:
     data = json.load(sys.stdin).get('result', {})
 except Exception:
@@ -42,10 +46,19 @@ if not data or (
 
 is_sandbox = bool(data.get('isSandbox'))
 is_scratch = bool(data.get('isScratch'))
-is_devhub  = bool(data.get('isDevHub'))
 instance   = (data.get('instanceUrl') or '').lower()
-# Trials carry an expiration date in sf org display output.
-has_trial_exp = bool(data.get('trialExpirationDate'))
+# Trials/SDOs carry an expiration date in their sf org list record. The CLI spells it
+# 'trailExpirationDate' (long-standing typo); accept the corrected spelling too. The
+# date is cached at login and never refreshed, so only a future date counts: a trial
+# later converted to production keeps its stale past date and must not pass as a trial.
+def _future(value):
+    try:
+        # Dates are UTC; compare against today's UTC date, not the host's local date.
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        return datetime.date.fromisoformat(str(value)[:10]) >= today
+    except ValueError:
+        return False
+has_trial_exp = _future(data.get('trailExpirationDate') or data.get('trialExpirationDate'))
 
 # Sandbox host markers: My Domain sandboxes embed '--<sbname>'; classic uses test.salesforce.com.
 is_sandbox_host = 'test.salesforce.com' in instance or '--' in instance
@@ -62,16 +75,16 @@ TRIAL_HOST_MARKERS = (
 )
 is_trial_host = has_trial_exp or any(m in instance for m in TRIAL_HOST_MARKERS)
 
-# Order matters: explicit scratch/sandbox signals win, then trial hosts, then
-# DevHub (treated non-prod, preserving prior behavior), else production.
+# Order matters: explicit scratch/sandbox signals win, then trial hosts, else
+# production. isDevHub is deliberately NOT a non-prod signal: Dev Hub is usually
+# enabled in the customer's production org, so a Dev Hub with no sandbox, scratch,
+# or trial signal is production.
 if is_scratch:
     print('scratch')
 elif is_sandbox or is_sandbox_host:
     print('sandbox')
 elif is_trial_host:
     print('trial')
-elif is_devhub:
-    print('devhub')
 else:
     print('production')
 "
@@ -285,10 +298,10 @@ sf_cli() {
         echo "sf-deploy-gate: refusing to run batch shim with shell metacharacters in args" >&2
         return 1
       fi
-      MSYS_NO_PATHCONV=1 "${COMSPEC:-cmd.exe}" /c "$bin" "$@"
+      FORCE_COLOR=0 NO_COLOR=1 MSYS_NO_PATHCONV=1 "${COMSPEC:-cmd.exe}" /c "$bin" "$@"
       ;;
     *)
-      "$bin" "$@"
+      FORCE_COLOR=0 NO_COLOR=1 "$bin" "$@"
       ;;
   esac
 }
@@ -335,10 +348,41 @@ except Exception:
 " 2>/dev/null
 }
 
-# Print the bucket for a given org alias by piping live org info through the classifier.
+# Print the bucket for a given org alias or username. Prefers the org's `sf org list`
+# record, which carries isSandbox/isScratch/isDevHub/trailExpirationDate; `sf org display`
+# returns none of those, so SDO/demo orgs without a host marker fell through to
+# production (forcedotcom/sf-skills#356). --skip-connection-status keeps this to a local
+# read with no per-org token refresh (#349). Falls back to `sf org display` when the org
+# isn't in the list, preserving the previous behavior.
 get_org_bucket() {
   local org_alias="$1"
-  sf_cli org display --target-org "$org_alias" --json 2>/dev/null | classify_org_json
+  local record
+  record=$(sf_cli org list --skip-connection-status --json 2>/dev/null | pick_org_record "$org_alias")
+  if [ -n "$record" ]; then
+    printf '%s' "$record" | classify_org_json
+  else
+    sf_cli org display --target-org "$org_alias" --json 2>/dev/null | classify_org_json
+  fi
+}
+
+# Read `sf org list --json` on stdin and print `{"result": <record>}` for the org whose
+# alias, username, or org ID equals $1 (case-insensitively), or nothing when there's no
+# match or the input won't parse.
+pick_org_record() {
+  python3 -c "
+import json, sys
+target = sys.argv[1].lower()
+try:
+    data = json.load(sys.stdin).get('result', {}) or {}
+except Exception:
+    sys.exit(0)
+for rows in data.values():
+    for o in rows if isinstance(rows, list) else []:
+        names = (o.get('alias'), o.get('username'), o.get('orgId')) if isinstance(o, dict) else ()
+        if target and target in [str(n).lower() for n in names if n]:
+            print(json.dumps({'result': o}))
+            sys.exit(0)
+" "$1" 2>/dev/null
 }
 
 # All emissions carry this source tag so a denial is never misattributed to
@@ -393,7 +437,7 @@ COMMAND="${1:-prod-check}"
 # interpreter instead of missing org data.
 if ! command -v python3 &> /dev/null; then
   echo "sf-deploy-gate: python3 not found on PATH — skipping org classification, failing open (see README Requirements)" >&2
-  if [ "$COMMAND" = "classify" ]; then
+  if [ "$COMMAND" = "classify" ] || [ "$COMMAND" = "bucket" ]; then
     echo "unknown"
   else
     echo '{"continue": true, "systemMessage": "'"$GATE_TAG"' python3 not found — org classification skipped, allowing."}'
@@ -402,8 +446,9 @@ if ! command -v python3 &> /dev/null; then
 fi
 
 # Read PreToolUse input from stdin (Claude Code passes the tool args in JSON).
-# `classify` reads org JSON on stdin instead, so only slurp here for the hook commands.
-if [ "$COMMAND" != "classify" ]; then
+# `classify` reads org JSON on stdin and `bucket` takes an argument, so only slurp
+# here for the hook commands.
+if [ "$COMMAND" != "classify" ] && [ "$COMMAND" != "bucket" ]; then
   INPUT=$(cat 2>/dev/null || echo '{}')
 fi
 
@@ -411,6 +456,14 @@ case "$COMMAND" in
   classify)
     # Pure classifier path: org JSON on stdin → bucket on stdout. No network.
     classify_org_json
+    ;;
+
+  bucket)
+    if [ -z "${2:-}" ]; then
+      echo "usage: sf-deploy-gate bucket <alias|username|orgId>" >&2
+      exit 2
+    fi
+    get_org_bucket "$2"
     ;;
 
   prod-check)

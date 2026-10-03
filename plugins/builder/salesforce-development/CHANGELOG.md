@@ -7,6 +7,58 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-10-02
+
+### Added
+
+- **Agentforce agent development is now a recommended companion plugin.** The `agentforce-adlc`
+  plugin, which authors, tests, deploys, and observes Agentforce agents, is now publicly
+  available. Plugin recommendations can suggest it, and `/salesforce-development:plugin-install`
+  can install it, when you work on Agentforce agents.
+- Changing a setting with `/salesforce-development:plugin-recommendations` now sends a
+  privacy-preserving telemetry signal for the choice you made: disable, reset to default, a named
+  sensitivity, or a custom sensitivity. The exact custom threshold and the command text are never
+  collected.
+
+### Changed
+
+- The Apex generation and SOQL query skills now get Salesforce language-server guidance from the
+  plugin at the moment the skill runs, instead of from extra text inside the skills. Apex gets
+  early compile diagnostics, followed by the usual Salesforce CLI validation. SOQL queries get a
+  syntax check before they run. If the language server is unavailable, both skills go straight to
+  the Salesforce CLI workflow and don't stop to search for or retry the language server.
+
+### Removed
+
+- Plugin recommendations and `/salesforce-development:plugin-install` only install plugins from
+  the Salesforce marketplace. The unused path for installing a recommended plugin from an external
+  source is gone. No recommended plugin was ever hosted elsewhere, so nothing you could install
+  before is affected.
+
+### Fixed
+
+- Salesforce MCP tools no longer stop working when an org's access token expires mid-session. The
+  gateway can report an expired token as "not found"; when that happens, the plugin now gets a
+  fresh token and retries once. A server that is genuinely inactive is retried again after a
+  cooldown, a limited number of times, instead of staying disconnected for the rest of the session.
+- Hooks no longer check the connection status of every authenticated org when they look up org
+  details (on prompt submit, after Bash commands, and in status output). That check sent one token
+  refresh per org, which could trip Salesforce login-anomaly detection and lock users with many
+  orgs out of client orgs. The org list is now read locally; only the target org is contacted.
+  The `/set-default` and `/logout` commands skip the same per-org check.
+  Also fixed org details silently going missing when Claude Code forced colored CLI output.
+  ([forcedotcom/sf-skills#349](https://github.com/forcedotcom/sf-skills/issues/349), reported by
+  [@matt-ascendably](https://github.com/matt-ascendably))
+- The deploy safety gate now recognizes Salesforce Demo Orgs (SDOs) and other active trial orgs on
+  a plain My Domain as non-production, so deploys to them are no longer blocked. Production orgs
+  are also classified more conservatively: a Dev Hub counts as production unless it is a sandbox,
+  scratch org, or active trial, and a trial expiration date in the past no longer marks an org as a
+  trial. Production orgs are now also reliably detected under Claude Code, where colored CLI output
+  could previously leave an org unclassified and let the deploy through. The quick-deploy,
+  destructive-deploy, and deploy-validate skills now use the same classification as the gate.
+  ([forcedotcom/sf-skills#356](https://github.com/forcedotcom/sf-skills/issues/356), reported by
+  [@brunoraraujo](https://github.com/brunoraraujo))
+
 ## [2.2.0] — 2026-09-21
 
 ### Added

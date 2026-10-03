@@ -195,6 +195,7 @@ def run_result(cmd: list, timeout: Optional[int] = None) -> RunResult:
             text=True,
             timeout=timeout,
             shell=False,
+            env=_shim.no_color_env(),
         )
     except subprocess.TimeoutExpired:
         return RunResult(False, "", None, "timeout")
@@ -385,7 +386,11 @@ def fetch_org_info_via_node() -> Optional[dict]:
 
 
 def get_org_list() -> dict:
-    return parse_json(run(["sf", "org", "list", "--json"])).get("result", {}) or {}
+    # --skip-connection-status: without it `sf org list` makes one refresh-token request
+    # per authenticated org, which from an unattended hook can trip login-anomaly
+    # detection and lock users out of orgs (forcedotcom/sf-skills#349). Nothing here
+    # reads connectedStatus, the only field the flag drops.
+    return parse_json(run(["sf", "org", "list", "--skip-connection-status", "--json"])).get("result", {}) or {}
 
 
 def get_org_display(target: str) -> dict:
@@ -3216,15 +3221,68 @@ def _record_nudge_painted(context_or_session) -> None:
     _claim_prompt_nudge(context)
 
 
+_SKILL_LSP_HINTS = {
+    "platform-apex-generate": (
+        "This plugin provides the Salesforce LSP for this skill. When available, "
+        "use `mcp__plugin_salesforce-development_salesforce-lsp__apex_diagnostics` "
+        "for early diagnostics on changed Apex files, then preserve the skill's "
+        "existing Salesforce CLI validation. An empty diagnostics result alone is "
+        "not proof of a successful compile. If diagnostics report an unknown "
+        "field or object that was just deployed, use "
+        "`mcp__plugin_salesforce-development_salesforce-lsp__refresh_org_schema` "
+        "once and re-run diagnostics before treating it as a code error. One "
+        "lookup per needed deferred LSP tool is fine; if a tool is not found or "
+        "returns an availability error, continue with the CLI workflow without "
+        "searching again for that tool, installing it, or repeatedly retrying it."
+    ),
+    "platform-soql-query": (
+        "This plugin provides the Salesforce LSP for this skill. When available, "
+        "prefer `mcp__plugin_salesforce-development_salesforce-lsp__validate_soql` "
+        "to syntax-check an authored SOQL query before execution. Preserve the "
+        "skill's existing handoff to `platform-data-manage` if runtime execution "
+        "is requested. If the LSP tool is unavailable, continue the canonical "
+        "skill workflow. A single lookup to load a "
+        "deferred LSP tool is fine; if it is not found or returns an availability "
+        "error, continue with the CLI workflow without further search, "
+        "installation, or repeated retries."
+    ),
+}
+
+
+def _skill_lsp_hint(skill: object, *, require_plugin_qualification: bool = False) -> str:
+    """Return plugin-runtime LSP guidance for the two skills that previously needed
+    overlays, without changing their canonical mirrored content.
+
+    Skill-tool payloads may contain either a bare name or this plugin's qualified
+    name, so the PreToolUse path accepts both. UserPromptExpansion is global across
+    installed commands, so that path requires this plugin's qualification.
+    """
+    if not isinstance(skill, str):
+        return ""
+    normalized = skill.strip()
+    prefix = "salesforce-development:"
+    if normalized.startswith(prefix):
+        name = normalized[len(prefix):]
+    elif require_plugin_qualification or ":" in normalized:
+        return ""
+    else:
+        name = normalized
+    return _SKILL_LSP_HINTS.get(name, "")
+
+
 def cmd_record_skill_dispatch() -> int:
-    """Record a Skill dispatch as an independent marker in this prompt namespace."""
+    """Record a Skill dispatch and attach bounded plugin-runtime guidance."""
     payload = _read_hook_payload()
     tool_input = payload.get("tool_input", {}) or payload.get("toolInput", {}) or {}
     skill = (tool_input.get("skill") or tool_input.get("skill_name")
              or tool_input.get("name") or "") if isinstance(tool_input, dict) else ""
     bare = skill.split(":")[-1] if isinstance(skill, str) else ""
     _record_dispatched_skill(_prompt_context(payload, rotate_fallback=False), bare)
-    print(json.dumps({"continue": True}))
+    hint = _skill_lsp_hint(skill)
+    if hint:
+        emit("PreToolUse", hint)
+    else:
+        print(json.dumps({"continue": True}))
     return 0
 
 
@@ -5090,7 +5148,7 @@ def _source_tracking_org_record(target: str) -> Optional[dict]:
     """Best-effort lookup of the default org's `sf org list` record by direct alias/username
     match. Returns None when the org can't be confidently identified (alias mismatch, no
     list) — the caller then falls back to the live `deploy preview` probe rather than
-    guessing. One cheap `sf org list --json` call; no `sf org display`."""
+    guessing. One `sf org list --skip-connection-status --json` call; no `sf org display`."""
     org_list = get_org_list()
     pool = (org_list.get("nonScratchOrgs") or []) + (org_list.get("scratchOrgs") or [])
     return next(
@@ -5403,7 +5461,7 @@ def _check_mcp() -> list:
             # Path.exists (no external tool), but everything in this module that
             # DOES shell out (get_target_org/get_org_display below) now runs
             # through the W-23466799 (WIN-026) resolver.
-            # NOTE (sf-skills-internal port): the bundle is vendored alongside this
+            # NOTE (plugin port): the bundle is vendored alongside this
             # module under scripts/, not under a bin/ subdir, so resolve it as a
             # sibling of __file__ (mirrors _bundled_helper_path for sf-org-info).
             proxy = Path(__file__).resolve().parent / "sf-mcp-proxy.bundled.js"
@@ -12188,6 +12246,10 @@ def cmd_command_paint(payload: Optional[dict] = None) -> int:
             print(json.dumps({"continue": True}))
             return 0
         command_name = payload.get("command_name")
+        lsp_hint = _skill_lsp_hint(command_name, require_plugin_qualification=True)
+        if lsp_hint:
+            emit("UserPromptExpansion", lsp_hint)
+            return 0
         if command_name == _DISCOVERY_COMMAND:
             # Discovery branches on its args (overview vs hints vs silent), so it is
             # not in the painter table. Both paint modes ALWAYS produce a present
@@ -13235,6 +13297,7 @@ def cmd_plugin_match_config(args: list[str]) -> int:
             print("⚠️  Could not clear your saved preference (the preference file is "
                   "busy or unwritable). Try again in a moment.", file=sys.stderr)
             return 1
+        _fire_plugin_recommendation_configured("reset", "default")
         print("✅ Plugin recommendations reset to the plugin's default sensitivity.\n"
               "   Check it any time with: /salesforce-development:plugin-recommendations status")
         return 0
@@ -13245,6 +13308,7 @@ def cmd_plugin_match_config(args: list[str]) -> int:
                   "unwritable). Try again in a moment, or set SF_DISABLE_PLUGIN_MATCH=1 "
                   "to stop it immediately.", file=sys.stderr)
             return 1
+        _fire_plugin_recommendation_configured("disable", "off")
         print("🛑 Plugin recommendations are now OFF for this user.\n"
               "   Turn them back on any time with: /salesforce-development:plugin-recommendations on")
         return 0
@@ -13262,6 +13326,11 @@ def cmd_plugin_match_config(args: list[str]) -> int:
             print("⚠️  Could not persist the setting (the preference file is busy or "
                   "unwritable). Try again in a moment.", file=sys.stderr)
             return 1
+        if parsed == "off":
+            _fire_plugin_recommendation_configured("disable", "off")
+        else:
+            level = parsed if isinstance(parsed, str) else "custom"
+            _fire_plugin_recommendation_configured("set", level)
         threshold = _resolve_plugin_match_threshold(parsed)
         resolved = threshold if threshold is not None else "module default"
         print(f"✅ Plugin-match sensitivity set to {parsed} (effective threshold: {resolved}).")
@@ -13296,26 +13365,12 @@ _PLUGIN_INSTALL_SUBPROCESS_ENV_KEYS = {
 _PLUGIN_INSTALL_TIMEOUT_SECONDS = 120
 _PLUGIN_INSTALL_MAX_STREAM_BYTES = 4000
 
-# Marketplace routing. Local-source entries (`./plugins/builder/<name>`) live in this
-# repo's own "salesforce" marketplace, published at `forcedotcom/sf-skills`. External
-# url-source entries (e.g. agentforce-adlc) are not in that marketplace at all -- they
-# are registered in Claude Code's pre-installed official marketplace, so they install
-# from there without any `marketplace add` step.
+# Every catalog entry is local (`./plugins/builder/<name>` or, per the
+# W-24078663 gap noted on _plugin_install_is_same_marketplace, some other
+# in-repo relative path). They all live in this repo's own "salesforce"
+# marketplace, published at `forcedotcom/sf-skills`.
 _SALESFORCE_MARKETPLACE_NAME = "salesforce"
 _SALESFORCE_MARKETPLACE_REPO = "forcedotcom/sf-skills"
-_OFFICIAL_MARKETPLACE_NAME = "claude-plugins-official"
-_OFFICIAL_MARKETPLACE_REPO = "anthropics/claude-plugins-official"
-
-# Exact (plugin-name, marketplace) identities trusted for looser install
-# confirmation -- a structured AskUserQuestion answer or a late bare affirmative
-# -- in addition to any local `./plugins/builder/<name>` salesforce-marketplace
-# entry. This is a small, reviewed allowlist, NOT inference from source shape: a
-# `<name>@<marketplace>` install resolves the entry BY NAME from that marketplace
-# (the catalog url of an external entry is provenance/display only and is never
-# fetched), so trusting the exact identity trusts exactly the install that runs.
-# Any external entry whose (name, marketplace) is absent stays on the nonce +
-# TRUST WARNING confirmation path. Adding one is a deliberate code change.
-_TRUSTED_EXTERNAL_INSTALLS = frozenset({("agentforce-adlc", _OFFICIAL_MARKETPLACE_NAME)})
 
 
 def _plugin_install_subprocess_env(env) -> dict:
@@ -13505,51 +13560,30 @@ def _plugin_install_is_same_marketplace(name: str, entry: dict) -> bool:
 def _plugin_install_is_trusted_source(name: str, entry: dict) -> bool:
     """Whether `name`/`entry` may be accepted with looser confirmation.
 
-    Two trust grounds, both explicit -- trust is never inferred from source
-    shape (see the W-24078663 note on _plugin_install_marketplace_name):
-
-    * the exact local salesforce-marketplace source
-      (_plugin_install_is_same_marketplace), or
-    * an exact (name, marketplace) match in the curated
-      _TRUSTED_EXTERNAL_INSTALLS allowlist -- keyed on the *routed* marketplace,
-      i.e. the `<name>@<marketplace>` identity the install actually resolves, so
-      a non-allowlisted external entry (any other name) stays on the nonce path.
+    The sole trust ground is the exact local salesforce-marketplace source
+    (_plugin_install_is_same_marketplace); anything else -- including a local
+    entry outside `plugins/builder/<name>`, per the W-24078663 gap noted there
+    -- stays on the nonce + confirmation path.
     """
-    if _plugin_install_is_same_marketplace(name, entry):
-        return True
-    if not isinstance(name, str) or not isinstance(entry, dict):
-        return False
-    return (name, _plugin_install_marketplace_name(name, entry)) in _TRUSTED_EXTERNAL_INSTALLS
+    return _plugin_install_is_same_marketplace(name, entry)
 
 
 def _plugin_install_marketplace_name(name: str, entry: dict) -> str:
-    """The marketplace to install `name` from, chosen by its catalog source shape.
+    """The marketplace to install `name` from.
 
-    The catalog's own local-vs-external distinction is the *shape* of `source`:
-    a string source (`./plugins/...`) is a local entry routed to this repo's
-    "salesforce" marketplace (which _ensure_salesforce_marketplace_registered
-    registers on demand); an object/url source (e.g. agentforce-adlc) is
-    external, is not in the "salesforce" marketplace at all, and lives in Claude
-    Code's pre-registered official marketplace, so it installs from there with no
-    registration step.
+    Every catalog entry is local, so this is always the "salesforce"
+    marketplace (which _ensure_salesforce_marketplace_registered registers on
+    demand). Kept as a function rather than inlining the constant because
+    call sites read as "the marketplace for this entry", not "a fixed name".
 
-    This is deliberately broader than _plugin_install_is_same_marketplace, whose
-    exact `./plugins/builder/<name>` match is a *trust gate* for skipping install
-    re-confirmation -- not a marketplace-membership test. Routing on that predicate
-    would misroute any local entry outside `plugins/builder/` (e.g. an opted-in
-    `./plugins/internal/*` plugin) to the official marketplace, where it does not
-    exist, failing with an opaque exit=1.
-
-    KNOWN GAP (W-24078663): source *shape* is not a proof of
-    *publication*. A local entry that is stripped from the public marketplace by
-    release-to-public's PLUGIN_ALLOWLIST (e.g. salesforce-test-drive) still routes
-    to "salesforce" here and fails at install time because it was never published
-    there. Correcting this needs explicit per-entry installability/marketplace
-    metadata (or excluding unpublished locals from the bundled catalog), tracked
-    separately."""
-    if isinstance(entry, dict) and isinstance(entry.get("source"), str):
-        return _SALESFORCE_MARKETPLACE_NAME
-    return _OFFICIAL_MARKETPLACE_NAME
+    KNOWN GAP (W-24078663): being local is not a proof of *publication*. A
+    local entry that is stripped from the public marketplace by
+    release-to-public's PLUGIN_ALLOWLIST (e.g. salesforce-test-drive) still
+    routes to "salesforce" here and fails at install time because it was
+    never published there. Correcting this needs explicit per-entry
+    installability/marketplace metadata (or excluding unpublished locals
+    from the bundled catalog), tracked separately."""
+    return _SALESFORCE_MARKETPLACE_NAME
 
 
 def _plugin_install_acceptance_allowed(name: str, session_id: str) -> bool:
@@ -13586,21 +13620,14 @@ def _render_plugin_install_dry_run(name: str, entry: dict, nonce: str) -> str:
     lines = [
         f"Plugin: {name}",
         f"Source: {source_text}",
-        # The catalog `source` above is the entry's recorded origin; the actual
-        # install resolves `<name>@<marketplace>`. For an external (url-source)
-        # entry these differ -- the bundled source is a url record, but the
-        # install pulls the same-name entry from Claude Code's official
-        # marketplace -- so state the real install target the user is confirming.
         f"Installs from: {name}@{marketplace}",
     ]
-    # Shape-based, not trust-based: this preview/confirm path shows the external
-    # source warning for ANY non-local source, including a curated-allowlist
-    # entry (e.g. agentforce-adlc). Allowlist trust governs only whether an
-    # *accepted proposal* installs immediately (the fast path, which never
-    # reaches this render) -- it does not certify the external code is safe, so
-    # a bare self-directed preview still honestly warns that the install runs
-    # code/hooks this project does not control. Keeping the single trust
-    # decision at the install fork (not duplicated here) preserves invariant 1.
+    # _plugin_install_is_same_marketplace requires an EXACT
+    # `./plugins/builder/<name>` match; anything else -- a mismatched path, a
+    # local entry outside plugins/builder/ (the W-24078663 gap), or a future
+    # mutable source form -- still warns here even though installation always
+    # targets the same "salesforce" marketplace, because an inexact match is
+    # not a verified identity: confirm it with the user before proceeding.
     if not _plugin_install_is_same_marketplace(name, entry):
         lines.append(
             "TRUST WARNING: this is not the exact same-name plugin path in the "
@@ -13715,6 +13742,28 @@ def _fire_plugin_install_result(reason: str, session_id: str, plugin: str = "unk
         pass  # telemetry must never break the install/decline flow
 
 
+def _fire_plugin_recommendation_configured(action: str, level: str) -> None:
+    """Emit one successful recommendation-preference mutation, fail-silently.
+
+    Only the caller-owned closed action/level pair is passed. Raw command input,
+    numeric thresholds, previous/effective values, and preference paths never
+    cross this boundary. sf_telemetry independently revalidates both values.
+    """
+    try:
+        sf_telemetry = _load_sf_telemetry()
+        if sf_telemetry is None:
+            return
+        sf_telemetry.capture_event(
+            "plugin_recommendation_configured", "",
+            {
+                "tool_input": {"action": action, "level": level},
+                "session_id": _plugin_session_id(),
+            },
+        )
+    except Exception:
+        pass  # telemetry must never break preference persistence or command output
+
+
 def _plugin_install_fire_loaded(name: str, entry: dict, session_id: str) -> None:
     """Phase 4.5 accept half: fire `plugin_loaded` ONLY when this exact plugin
     was proposed earlier in this session (either band, either surface), then
@@ -13815,8 +13864,7 @@ def _cmd_plugin_install_decline(name: str, session_id: str) -> int:
 def _perform_plugin_install(name: str, entry: dict, session_id: str) -> int:
     """Install one already-authorized entry and render the activation handoff."""
     marketplace = _plugin_install_marketplace_name(name, entry)
-    if marketplace == _SALESFORCE_MARKETPLACE_NAME:
-        _ensure_salesforce_marketplace_registered(os.environ)
+    _ensure_salesforce_marketplace_registered(os.environ)
     ok, execution = _run_plugin_install_step(
         ["claude", "plugin", "install", f"{name}@{marketplace}", "--yes"], env=os.environ
     )
@@ -13827,24 +13875,12 @@ def _perform_plugin_install(name: str, entry: dict, session_id: str) -> int:
         )
         # `marketplace update` only works once the marketplace exists, so name
         # `add` for the unregistered case and `update` for the stale case.
-        if marketplace == _SALESFORCE_MARKETPLACE_NAME:
-            message += (
-                f"\nIf {marketplace!r} is not registered, run "
-                f"`claude plugin marketplace add {_SALESFORCE_MARKETPLACE_REPO}`; "
-                f"if it is registered but stale, run "
-                f"`claude plugin marketplace update {marketplace}`. Then retry."
-            )
-        else:
-            # "claude-plugins-official" is normally pre-registered by Claude Code,
-            # but auto-registration only happens on a successful interactive
-            # launch and can be absent (non-interactive startup, network failure,
-            # a fresh config dir). If so the install fails on an unknown
-            # marketplace, so name the one-time registration remediation.
-            message += (
-                f"\nIf {marketplace!r} is not registered (it is normally "
-                f"pre-registered by Claude Code), run "
-                f"`claude plugin marketplace add {_OFFICIAL_MARKETPLACE_REPO}` and retry."
-            )
+        message += (
+            f"\nIf {marketplace!r} is not registered, run "
+            f"`claude plugin marketplace add {_SALESFORCE_MARKETPLACE_REPO}`; "
+            f"if it is registered but stale, run "
+            f"`claude plugin marketplace update {marketplace}`. Then retry."
+        )
         print(message, file=sys.stderr)
         _fire_plugin_install_result("subprocess_failure", session_id, name)
         return 3

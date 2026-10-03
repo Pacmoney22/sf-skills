@@ -327,6 +327,10 @@ _ALLOWLIST = {
     # (rather than reshaping) command.invoked, whose established
     # outcome::category tuple must remain backwards-compatible.
     "plugin_install_result": {"plugin", "reason"},
+    # Successful mutations made through /plugin-recommendations. Both fields are
+    # fixed producer-owned vocabularies; raw arguments and numeric thresholds are
+    # intentionally absent from the schema.
+    "plugin_recommendation_configured": {"action", "level"},
     # feedback: /feedback's structured signal -- rating (int 1-5) only. Never a
     # free-text key; see capture_event's `feedback` branch.
     "feedback": {"rating"},
@@ -346,6 +350,11 @@ _PLUGIN_INSTALL_REASONS = frozenset({
     "proposal_not_selected",
     "stale_nonce",
     "subprocess_failure",
+})
+
+_PLUGIN_RECOMMENDATION_ACTIONS = frozenset({"disable", "reset", "set"})
+_PLUGIN_RECOMMENDATION_LEVELS = frozenset({
+    "off", "default", "low", "standard", "high", "custom",
 })
 
 # `error_class` is the one user-influenced value that reaches the wire (PDP componentId
@@ -1112,6 +1121,7 @@ def _resolve_org_context() -> dict:
         proc = subprocess.run(
             cmd,
             capture_output=True, text=True, timeout=_ORG_RESOLVE_TIMEOUT_S,
+            env=_shim.no_color_env(),
         )
         result = (json.loads(proc.stdout) or {}).get("result", {}) if proc.stdout else {}
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, ValueError):
@@ -1651,6 +1661,18 @@ def capture_event(event: str, outcome: str, payload: dict) -> None:
             _write_event(event, {"plugin": plugin, "reason": reason}, payload)
             return
 
+        if event == "plugin_recommendation_configured":
+            # In-process-only command signal. Validate each field independently
+            # against its closed vocabulary before either can reach the buffer.
+            action = tool_input.get("action") if isinstance(tool_input, dict) else None
+            level = tool_input.get("level") if isinstance(tool_input, dict) else None
+            if (not isinstance(action, str) or action not in _PLUGIN_RECOMMENDATION_ACTIONS
+                    or not isinstance(level, str)
+                    or level not in _PLUGIN_RECOMMENDATION_LEVELS):
+                return
+            _write_event(event, {"action": action, "level": level}, payload)
+            return
+
         if event == "feedback":
             # In-process-only call from /feedback's capture step (never a hook):
             # rating, nothing else. HARD INVARIANT (feedback-telemetry plan):
@@ -1778,8 +1800,10 @@ _FIRST_RUN_NOTICE_LINES = (
     "or editor running the plugin. It also collects the",
     "commands, skills, subagents, and MCP tools that ran,",
     "whether each succeeded or failed, and coarse",
-    "error categories. If you use /feedback, it also collects a",
-    "numeric satisfaction rating -- never your typed comments.",
+    "error categories. It collects plugin recommendation setting",
+    "changes made through this plugin. If you use /feedback, it",
+    "also collects a numeric satisfaction rating -- never your",
+    "typed comments.",
     "The plugin never collects source code,",
     "org contents, file paths, credentials, or org names.",
     "",
@@ -2047,6 +2071,18 @@ def _to_pdp_event(record: dict, org_bucket: Optional[str] = None) -> Optional[di
         return {**base, "eventName": "pluginInstall.completed",
                 "componentId": plugin,
                 "contextName": "reason", "contextValue": reason}
+    if event == "plugin_recommendation_configured":
+        # Defense-in-depth for legacy/tampered buffers: neither half of the tuple
+        # reaches a wire shape unless both remain in the fixed vocabularies.
+        action, level = p.get("action"), p.get("level")
+        if (not isinstance(action, str) or action not in _PLUGIN_RECOMMENDATION_ACTIONS
+                or not isinstance(level, str)
+                or level not in _PLUGIN_RECOMMENDATION_LEVELS):
+            return None
+        return {**base, "eventName": "pluginRecommendation.configured",
+                "componentId": "sensitivity",
+                "contextName": "action::level",
+                "contextValue": f"{action}::{level}"}
     if event == "skill_dispatched":
         # The bare skill name (platform-apex-generate) already embeds its domain,
         # so it stands alone as the componentId; skill_domain is the grouping dim.

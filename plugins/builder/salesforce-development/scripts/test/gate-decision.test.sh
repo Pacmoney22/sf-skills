@@ -20,18 +20,28 @@ STUB_DIR=$(mktemp -d)
 trap 'rm -rf "$STUB_DIR"' EXIT
 cat > "$STUB_DIR/sf" <<'STUB'
 #!/bin/bash
-# Minimal sf stub: only the two subcommands the gate calls.
+# Minimal sf stub: only the subcommands the gate calls. Mimics Claude Code's
+# FORCE_COLOR leak (#349): any FORCE_COLOR other than 0 wraps the JSON in ANSI.
+color() { if [ -n "${FORCE_COLOR:-}" ] && [ "$FORCE_COLOR" != 0 ]; then printf '\033[97m%s\033[39m' "$1"; else printf '%s' "$1"; fi; }
 case "$*" in
+  "org list --skip-connection-status --json")
+    color "${STUB_ORG_LIST_JSON:-{\}}"
+    ;;
+  "org list"*)
+    # A bare `sf org list` refreshes a token per org (#349) — record it so the test fails.
+    echo "$*" >> "$STUB_DIR/bare-org-list"; printf '{}'
+    ;;
   "config get target-org --json")
     printf '{"result":[{"name":"target-org","value":"%s"}]}' "${STUB_DEFAULT_ORG:-stuborg}"
     ;;
   "org display --target-org "*" --json"|"org display "*"--json")
-    printf '%s' "${STUB_ORG_JSON:-{\}}"
+    color "${STUB_ORG_JSON:-{\}}"
     ;;
   *) printf '{}' ;;
 esac
 STUB
 chmod +x "$STUB_DIR/sf"
+export STUB_DIR
 export PATH="$STUB_DIR:$PATH"
 
 # decision <expected: allow|deny> <description> <command> <org-json>
@@ -273,6 +283,69 @@ print(json.dumps({"tool_input": {"command": "bash <<EOF\nsf project \\\ndeploy s
 PY
 )
 gate_expect prod-check deny "B heredoc + continuation → deny" "$B_HEREDOC_JSON"
+
+# --- #356: classify from the `sf org list` record, not `sf org display` ------------
+# `sf org display` carries no isSandbox/isScratch/expiration, so an SDO on a plain
+# My Domain looked like production. Its org list record has trailExpirationDate (sic).
+PROD_LIKE_DISPLAY='{"result":{"alias":"sdo","instanceUrl":"https://co1778596511055.my.salesforce.com"}}'
+export STUB_ORG_LIST_JSON='{"result":{"nonScratchOrgs":[{"alias":"sdo","username":"admin@sdo.demo","orgId":"00DSDO000000001AAA","isSandbox":false,"isScratch":false,"orgEdition":"Enterprise Edition","instanceUrl":"https://co1778596511055.my.salesforce.com","trailExpirationDate":"2099-06-18T19:21:38.000+0000"},{"alias":"prod","username":"admin@acme.com","isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.my.salesforce.com"},{"alias":"converted","username":"admin@converted.com","isSandbox":false,"isScratch":false,"instanceUrl":"https://converted.my.salesforce.com","trailExpirationDate":"2020-01-01T00:00:00.000+0000"}],"devHubs":[{"alias":"hub","username":"admin@hub.com","isDevHub":true,"isSandbox":false,"isScratch":false,"instanceUrl":"https://hub.my.salesforce.com"}]}}'
+decision allow "#356 SDO destructive (org list record) → allow" \
+  "sf project deploy start --manifest destructiveChanges.xml --target-org sdo" "$PROD_LIKE_DISPLAY"
+decision allow "#356 SDO matched by username → allow" \
+  "sf project deploy start --manifest destructiveChanges.xml --target-org admin@sdo.demo" "$PROD_LIKE_DISPLAY"
+decision allow "#356 SDO plain deploy → allow" \
+  "sf project deploy start --target-org sdo" "$PROD_LIKE_DISPLAY"
+decision allow "#356 username match is case-insensitive → allow" \
+  "sf project deploy start --target-org Admin@SDO.demo" "$PROD_LIKE_DISPLAY"
+decision deny "#356 production Dev Hub → deny" \
+  "sf project deploy start --target-org hub" '{}'
+decision deny "#356 converted trial (past expiration) → deny" \
+  "sf project deploy start --target-org converted" '{}'
+decision allow "#356 SDO matched by org ID → allow" \
+  "sf project deploy start --target-org 00DSDO000000001AAA" "$PROD_LIKE_DISPLAY"
+
+# `bucket <org>` is what the deploy skills call; it must match the hook's resolution.
+bucket_expect() {
+  local expected="$1" desc="$2" org="$3" got
+  got=$("$GATE" bucket "$org" </dev/null)
+  if [ "$got" = "$expected" ]; then
+    PASS=$((PASS + 1)); printf '  ok   %-46s → %s\n' "$desc" "$got"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL %-46s → got "%s", expected "%s"\n' "$desc" "$got" "$expected"
+  fi
+}
+export STUB_ORG_JSON="$PROD_LIKE_DISPLAY"
+bucket_expect trial "bucket: SDO from org list → trial" sdo
+bucket_expect production "bucket: production Dev Hub → production" hub
+FORCE_COLOR=3 bucket_expect production "bucket: FORCE_COLOR=3 prod → production" prod
+export STUB_ORG_JSON='{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://uat--x.sandbox.my.salesforce.com"}}'
+bucket_expect sandbox "bucket: not listed → org display fallback" other
+if "$GATE" bucket </dev/null >/dev/null 2>&1; then
+  FAIL=$((FAIL + 1)); printf '  FAIL %-46s\n' "bucket: missing org arg exits nonzero"
+else
+  PASS=$((PASS + 1)); printf '  ok   %-46s\n' "bucket: missing org arg exits nonzero"
+fi
+decision deny "#356 prod in org list → deny" \
+  "sf project deploy start --manifest destructiveChanges.xml --target-org prod" '{}'
+decision deny "#356 org not in list → org display fallback → deny" \
+  "sf project deploy start --target-org other" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://other.my.salesforce.com"}}'
+
+# --- #349: FORCE_COLOR from Claude Code must not blind the classifier ------------
+# Colorized JSON used to fail to parse → "unknown" → fail-open ALLOW on real prod.
+FORCE_COLOR=3 decision deny "#349 FORCE_COLOR=3 prod (org list) → deny" \
+  "sf project deploy start --target-org prod" '{}'
+unset STUB_ORG_LIST_JSON
+FORCE_COLOR=3 decision deny "#349 FORCE_COLOR=3 prod (org display) → deny" \
+  "sf project deploy start --target-org prod" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.my.salesforce.com"}}'
+
+# --- #349: the gate must never run a bare `sf org list` (per-org token refresh) ---
+if [ -e "$STUB_DIR/bare-org-list" ]; then
+  FAIL=$((FAIL + 1)); printf '  FAIL %-46s → %s\n' "#349 no bare sf org list" "$(tr '\n' ';' < "$STUB_DIR/bare-org-list")"
+else
+  PASS=$((PASS + 1)); printf '  ok   %-46s\n' "#349 no bare sf org list"
+fi
 
 echo ""
 echo "  $PASS passed, $FAIL failed"
