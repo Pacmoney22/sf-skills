@@ -1,3 +1,12 @@
+# [1.59.0](https://github.com/forcedotcom/sf-skills/compare/1.58.0...1.59.0) (2026-10-03)
+
+
+### Features
+
+* Release salesforce-development 2.3.0 plugins @W-24390853@ ([56887a5](https://github.com/forcedotcom/sf-skills/commit/56887a59081116a9822ac85e8c76ecee088a4bd9))
+
+
+
 # [1.58.0](https://github.com/forcedotcom/sf-skills/compare/1.57.0...1.58.0) (2026-09-25)
 
 
